@@ -49,6 +49,8 @@ export interface UseHeaderToolbarOptions {
 	executionDevicesQuery: QueryLike;
 
 	// Active-state inputs.
+	/** Per-narrator availability: this session is in orchestration mode. */
+	orchestrationAvailable: boolean;
 	mobileTasksOpen: boolean;
 	mobileToolPanel: MobileToolPanelKind | null;
 	detailsOpened: boolean;
@@ -106,6 +108,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		onOpenTerminalPanel,
 		browserSessionsSupported,
 		executionDevicesQuery,
+		orchestrationAvailable,
 		mobileTasksOpen,
 		mobileToolPanel,
 		detailsOpened,
@@ -151,6 +154,12 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					return (executionDevicesQuery.data?.devices.length ?? 0) > 0;
 				case "plugins":
 					return !!dock;
+				case "orchestration":
+					// Only meaningful on a session that IS orchestrated: the panel exists to
+					// answer "what is this run doing and what has it cost", which has no
+					// answer outside orchestration mode. Offering it anyway would put a
+					// button in every narrator's toolbar that opens a panel saying nothing.
+					return orchestrationAvailable;
 				default:
 					return true;
 			}
@@ -159,6 +168,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			tasksSupported,
 			tasksButtonEnabled,
 			specToolAvailable,
+			orchestrationAvailable,
 			terminalToolAvailable,
 			onOpenTerminalPanel,
 			gitWorkspaceAvailable,
@@ -207,7 +217,10 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "userchat":
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
 				case "filetree":
+				case "filetree":
 					return dock ? dock.openToolTypes.has("filetree") : mobileToolPanel === "filetree";
+				case "orchestration":
+					return dock?.openToolTypes.has("orchestration") ?? false;
 				default:
 					return false;
 			}
@@ -256,6 +269,12 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				// transcript while a slider moves, so there is no drawer fallback to offer.
 				case "appearance":
 					dock?.toggleToolPanel("appearance");
+					return;
+				// Dock-only as well: it exists to sit beside the transcript while a run is in
+				// flight. The status-bar popover still covers the "quick glance" need on
+				// mobile, so there is nothing to fall back to here.
+				case "orchestration":
+					dock?.toggleToolPanel("orchestration");
 					return;
 				default:
 					return;

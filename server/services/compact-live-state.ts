@@ -100,6 +100,25 @@ export function subscribeLiveCompactProgress(
 	};
 }
 
+/**
+ * 压缩从中途换用回落模型时，同步刷新实时进度里的模型名。
+ *
+ * 「运行中的卡片显示哪个模型」只有这一处来源（`getCompactSummary` 在
+ * `status === "compacting"` 时读 `live.model`），不同步的话回落那段时间里
+ * 卡片会一直显示第一层的模型 —— 而实际在生成摘要的是回落模型。
+ */
+export function retargetLiveCompactModel(
+	messageId: string,
+	model: string,
+	reasoningEffort?: string,
+): void {
+	const current = liveCompactProgress.get(messageId);
+	if (!current) return;
+	current.model = model;
+	if (reasoningEffort !== undefined) current.reasoningEffort = reasoningEffort;
+	else delete current.reasoningEffort;
+}
+
 export function appendLiveCompactDelta(
 	messageId: string,
 	channel: LiveCompactChannel,

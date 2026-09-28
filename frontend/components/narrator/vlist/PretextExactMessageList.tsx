@@ -2118,6 +2118,9 @@ export const PretextExactMessageList = memo(
 				// adaptation rather than painted in afterwards.
 				canOfferProviderFix: errorNotice.canOfferProviderFix,
 				canOfferModelTest: errorNotice.canOfferModelTest,
+				// 编排 worker 的「换模型继续」共用同一条条件按钮行，因此同样必须在
+				// 适配期就知道答案（参考其上面的注释）。
+				canOfferOrchestrationModelSwitch: errorNotice.canOfferOrchestrationModelSwitch,
 				resolveSubagentRecentSummary: resolveExactSubagentRecentSummary,
 				resolveRecentMessageIds,
 				resolveHasPendingPermission,

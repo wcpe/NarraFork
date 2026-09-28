@@ -127,9 +127,62 @@ ${blockedTaskActionInstructions["zh-CN"]}
 </system-reminder>`,
 };
 
-/** Get the model-facing Dynamic Spec usage reminder. */
-export function getDynamicSpecSystemReminder(locale: Locale): string {
-	return pickLocalizedValue(dynamicSpecSystemReminder, locale);
+/**
+ * 编制者版的 Dynamic Spec 提醒：规则同一份，只换掉"点名工具"的那几句。
+ *
+ * 编制者的工具面（`ORCHESTRATOR_TOOLS`）里没有 Bash / Glob / Grep，Write / Edit 也只
+ * 对 `spec://` 生效（见 `orchestrator-spec-write-guard.ts`）。提醒若继续按普通会话的
+ * 口气说"用 Write/Edit/Grep 操作 spec://"，就是在教它走一条它做不到的路径——
+ * 而这些提醒每一轮都会注入，代价是反复浪费整轮推理。
+ *
+ * 刻意用「替换具体句子」而不是复制一份全文：真正的规则（有限任务、protected、
+ * blocked 处理）只有一份，改一处不会漂移；替换漏掉时输出里会残留原句，
+ * 而这一点有测试盯着（编制者版不得再出现那些工具名）。
+ */
+const orchestratorToolClauseReplacements: readonly (readonly [string, string])[] = [
+	[
+		"Use `Read`, `Write`, `Edit`, and `Grep` directly with `spec://...` URIs:",
+		"Dynamic Spec files are addressed by `spec://...` URIs, and `Read` opens them:",
+	],
+	[
+		'- Use `Grep` with `path: "spec://"` to search Dynamic Spec files.',
+		"- There is no content search over Dynamic Spec; read the files you need by URI.",
+	],
+	[
+		"Do not use Bash or Glob for `spec://` virtual files.",
+		"`spec://` files are virtual: they never appear on the local filesystem, so only spec-aware tools reach them.",
+	],
+	[
+		"直接用 `Read`、`Write`、`Edit`、`Grep` 访问 `spec://...` URI：",
+		"Dynamic Spec 文件通过 `spec://...` URI 访问，用 `Read` 打开：",
+	],
+	[
+		'- 搜索 Dynamic Spec 文件时，用 `Grep` 并设置 `path: "spec://"`。',
+		"- Dynamic Spec 没有全文搜索，需要什么就按 URI 读。",
+	],
+	[
+		"不要用 Bash 或 Glob 访问 `spec://` 虚拟文件。",
+		"`spec://` 是虚拟文件，不出现在本地文件系统里，只有 spec 感知的工具能访问。",
+	],
+];
+
+/**
+ * Get the model-facing Dynamic Spec usage reminder.
+ *
+ * `options.orchestrator` 为真时返回编制者版（只换掉点名工具的那几句）。
+ * 省略该选项的输出与改动前**逐字相同**——普通 primary 与所有子代理都走这条路径。
+ */
+export function getDynamicSpecSystemReminder(
+	locale: Locale,
+	options: { orchestrator?: boolean } = {},
+): string {
+	const reminder = pickLocalizedValue(dynamicSpecSystemReminder, locale);
+	if (!options.orchestrator) return reminder;
+	let result = reminder;
+	for (const [from, to] of orchestratorToolClauseReplacements) {
+		result = result.replaceAll(from, to);
+	}
+	return result;
 }
 
 // toolMessages, ToolMessageKey, getToolMessage, getToolMessageWithParams

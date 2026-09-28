@@ -33,6 +33,8 @@ import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-e
  *   forwards it explicitly).
  * - `appearance` — live typography controls for this transcript (font size / letter
  *   spacing / block spacing), so the reader can adjust while watching the effect.
+ * - `orchestration` — the orchestration run's live state and token usage (which tier is
+ *   parked / in flight, how much the run has cost so far).
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `filetree` — a singleton browser of the narrator's cwd, which opens `file` panels.
@@ -50,6 +52,7 @@ export type PanelKind =
 	| "search"
 	| "userchat"
 	| "appearance"
+	| "orchestration"
 	| "filetree"
 	| "subagent"
 	| "file"
@@ -286,6 +289,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	search: "search",
 	userchat: "userchat",
 	appearance: "appearance",
+	orchestration: "orchestration",
 	filetree: "filetree",
 	subagent: "subagent",
 	file: "file",
@@ -313,6 +317,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	search: "Search",
 	userchat: "Discussion",
 	appearance: "Appearance",
+	orchestration: "Orchestration",
 	filetree: "Files",
 	subagent: "Subagent",
 	file: "File",

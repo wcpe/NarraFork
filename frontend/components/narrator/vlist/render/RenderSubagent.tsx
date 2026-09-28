@@ -37,6 +37,10 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
+import type {
+	OrchestrationWorkerTier,
+	OrchestrationWorkerType,
+} from "@shared/orchestration-worker-type";
 // The row height comes from the shared row metrics, resolved at RENDER time, so it
 // tracks the reader's typography exactly as the measure side does.
 import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
@@ -126,6 +130,32 @@ export interface SubagentLabels {
 	followTooltip?: string;
 	/** Tooltip on a pool-fallback badge: `{parentModel}` / `{pool}` placeholders. */
 	fallbackReason?: string;
+	/** 编排 worker 的模型 badge：等待模型恢复时的替代文案。 */
+	waitingModel?: string;
+	/** 编排 worker 的模型 badge：可点时的 tooltip。 */
+	switchWorkerModelTooltip?: string;
+	/**
+	 * 编排 worker 的档位 badge 文案，四档齐全（与服务端 `orchestrationTier_*` 同源）。
+	 *
+	 * 允许缺档：`RenderSubagent` 对这一项做了深合并，缺的档位用内置英文名兜底
+	 * （它是 labels 里唯一的对象型字段，浅合并会静默吃掉其余档位）。
+	 */
+	workerTier?: Partial<Record<OrchestrationWorkerTier, string>>;
+	/**
+	 * 编排 worker 的**身份 chip** 文案：执行者 / 复核者。
+	 *
+	 * 类型 chip 回答的是"这是谁"，而编排派发恰好回答不了：编排模式里 `subagent_type`
+	 * 刻意留空（类型由 `tier` 派生，见 task.ts 的 `buildParameters`），`agentType` 因此
+	 * 回退成工具名 `Agent`；复核者那边则是原始编码串
+	 * （`orch-review--<profileId>--<tier>`）。两者都看不出角色，这两个文案就是那个位置
+	 * 要画的字。
+	 *
+	 * 刻意用**两个平铺的字符串**而不是一个对象：`labels` 是浅合并的，对象型字段会被
+	 * 部分对象整个替换掉，缺的那几项静默变成 undefined（`workerTier` 就得为此单独
+	 * 做一次深合并）。平铺字段没有这个坑。
+	 */
+	workerExecutor?: string;
+	workerReviewer?: string;
 	/** File-changes section title ("Changed files"). */
 	fileChanges?: string;
 	/** Suffix for a file whose line counts are unknown. */
@@ -178,6 +208,13 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	followParent: "Follow parent",
 	followTooltip: "Following the parent model",
 	fallbackReason: "The parent's {parentModel} is not in the {pool} pool",
+	waitingModel: "Waiting for model",
+	switchWorkerModelTooltip: "This model is unavailable — switch to another and keep going",
+	// 编排档位的英文兜底：外壳（useVListLabels）会用 i18n 覆盖这四个。
+	workerTier: { chore: "Chore", quick: "Quick", medium: "Medium", heavy: "Heavy" },
+	// 编排 worker 的身份兜底：外壳（useVListLabels）会用 i18n 覆盖这两个。
+	workerExecutor: "Executor",
+	workerReviewer: "Reviewer",
 	fileChanges: "Changed files",
 	linesNotMeasured: "lines not measured",
 	moreFiles: "{count} more files",
@@ -253,6 +290,33 @@ interface RenderSubagentProps {
 	model?: string;
 	/** Follow/fallback decision when `model` is `__parent__`. */
 	modelInheritance?: SubagentModelInheritance;
+	/**
+	 * 编排 worker 的档位 badge（chore/quick/medium/heavy）。
+	 *
+	 * 只有编排 worker 才有值：它来自派发输入 / 类型编码的解析结果（见
+	 * segment-adapter 的 `orchestrationTier`），普通子代理永远拿不到一个档位。
+	 * 无法识别档位时**什么也不画**——一个"看起来同样权威"的假档位比没有更糟。
+	 */
+	workerTier?: string;
+	/**
+	 * 编排 worker 的角色（执行者 / 复核者），只用于身份 chip。
+	 *
+	 * **只认类型编码**（`workerKind` 由 `parseOrchestrationWorkerType` 从
+	 * `agentType` 解出，见 segment-adapter）。执行者的 `subagent_type` 是空的，因此
+	 * 这里通常是 undefined——那正是执行者的实际情况，按执行者显示。拿不到编码时
+	 * 宁可少说一句角色，也不能把一个执行者画成复核者。
+	 */
+	workerKind?: OrchestrationWorkerType["kind"];
+	/**
+	 * 编排 worker 的「换模型继续」入口（阶段 6）。
+	 *
+	 * 只有编排 worker（执行者 / 复核者）撞上模型不可用或配额等待时，模型 badge
+	 * 才变成可点。其余情况（非编排子代理、或一切正常的 worker）保持只读——
+	 * 一个平时也能点的 badge 会让人以为"随便换模型"是这个卡片的常规操作。
+	 */
+	onSwitchWorkerModel?: () => void;
+	/** 当前是否正停在模型不可用的等待上（决定 badge 可点 + 等待文案）。 */
+	modelWait?: { waitKind?: "credentials" | "quota"; model?: string; resumeAt?: number } | null;
 	/** Extra thinking-effort badge (cyan), mirroring SubagentCard.tsx. */
 	reasoningEffort?: string;
 	/** Collapsed result preview text (first ~120 chars). */
@@ -479,7 +543,14 @@ function SubagentModelBadge({
 
 export function RenderSubagent(props: RenderSubagentProps) {
 	const { measured, permissionSlot } = props;
-	const labels = { ...DEFAULT_LABELS, ...props.labels };
+	const labels = {
+		...DEFAULT_LABELS,
+		...props.labels,
+		// 档位文案是唯一一个**对象**型 label，浅合并会被部分对象整个替换掉：缺的
+		// 那几档变成 undefined，badge 静默消失（看起来像"这不是编排 worker"）。
+		// 这一处单独深合并，缺档仍有英文兜底。
+		workerTier: { ...DEFAULT_LABELS.workerTier, ...props.labels?.workerTier },
+	};
 	const inner = <SubagentInner {...props} labels={labels} />;
 	const hasPermission = permissionSlot !== undefined;
 
@@ -531,6 +602,90 @@ export function RenderSubagent(props: RenderSubagentProps) {
 	);
 }
 
+/**
+ * 模型 badge。默认是所有子代理都有的只读标签；当这张卡片是编排 worker（执行者/
+ * 复核者）且它的 turn 正停在模型不可用 / 配额的等待上时，它变成换模型入口。
+ *
+ * 为什么挂在 badge 上而不是再加一个按钮：等待中的卡片唯一"有话要说"的地方就是它
+ * 停在哪个模型上——用户要换的也正是那个东西。多一个按钮只会让这条固定高度的
+ * header 行变宽，而这里一个字都不用多占。
+ *
+ * badge 用 `component="button"` 而不是包一层 ActionIcon：它本来就是 header 行里的
+ * 一个固定高度元素，换标签只会让这一行多一个可聚焦节点，行高不变（测量层按
+ * badge 行整体测量）。点击必须 `stopPropagation`——badge 位于折叠整张卡的 header
+ * 里，不拦的话"换模型"会顺手把卡片收起来。
+ */
+function ModelBadge({
+	model,
+	wait,
+	onSwitch,
+	labels,
+}: {
+	model: string;
+	wait: { waitKind?: "credentials" | "quota"; model?: string; resumeAt?: number } | null;
+	onSwitch?: () => void;
+	labels: ResolvedSubagentLabels;
+}) {
+	const switchable = wait !== null && onSwitch !== undefined;
+	const text = wait
+		? labels.waitingModel
+		: model === FOLLOW_PARENT_MODEL
+			? labels.followParent
+			: model;
+	if (!switchable) {
+		return (
+			<Badge
+				data-testid="subagent-model"
+				data-waiting={wait ? "1" : undefined}
+				size="xs"
+				variant="light"
+				color={wait ? "orange" : "violet"}
+			>
+				{wait ? `${text} · ${model}` : text}
+			</Badge>
+		);
+	}
+	return (
+		<Tooltip label={labels.switchWorkerModelTooltip} withArrow>
+			<Badge
+				component="button"
+				type="button"
+				data-testid="subagent-model"
+				data-waiting="1"
+				data-switchable="1"
+				size="xs"
+				variant="filled"
+				color="orange"
+				style={{ cursor: "pointer" }}
+				onClick={(event: React.MouseEvent) => {
+					event.stopPropagation();
+					onSwitch?.();
+				}}
+			>
+				{`${text} · ${model}`}
+			</Badge>
+		</Tooltip>
+	);
+}
+
+/**
+ * 编排 worker 的档位 badge（chore/quick/medium/heavy）。
+ *
+ * 只读、不可点，也不带 tooltip：档位是这次派发的既定事实，卡片上没有可以改变它的
+ * 操作（换模型入口在模型 badge 上，而它换的是模型、不是档位）。
+ *
+ * 未识别的档位值返回 null：宁可不显示，也不显示一个看起来同样权威的错档位。
+ */
+function TierBadge({ tier, labels }: { tier: string; labels: ResolvedSubagentLabels }) {
+	const text = labels.workerTier?.[tier as OrchestrationWorkerTier];
+	if (!text) return null;
+	return (
+		<Badge data-testid="subagent-worker-tier" size="xs" variant="light" color="indigo">
+			{text}
+		</Badge>
+	);
+}
+
 function SubagentInner({
 	measured,
 	description,
@@ -539,6 +694,10 @@ function SubagentInner({
 	isTakenOver,
 	model,
 	modelInheritance,
+	workerTier,
+	workerKind,
+	modelWait,
+	onSwitchWorkerModel,
 	reasoningEffort,
 	resultPreview,
 	recentCallNames = [],
@@ -559,6 +718,25 @@ function SubagentInner({
 	const agentBadgeColor = ["explore", "plan", "general", "agent", "send"].includes(agentType)
 		? "indigo"
 		: "teal";
+	// 类型 chip 上究竟画什么字。
+	//
+	// 判定只认 `workerTier`：`tier` 参数只存在于编排上下文的 schema 里（非编排上下文
+	// 里连 schema 都不带它，见 task.ts 的 `buildParameters`），所以"有档位"就等于
+	// "这是一次编排派发"——非编排子代理因此一个字节都不会变。
+	//
+	// 角色只认 `workerKind`（类型编码是唯一权威来源）：拿不到编码时按执行者显示，
+	// 那正是执行者的实际情况（编排派发里 `subagent_type` 刻意留空）。
+	//
+	// `agentType` 本身**不动**：它同时是"换模型继续"的资格判定依据
+	// （`parseOrchestrationWorkerType`）与复核者识别依据，这里只是换一个标签。
+	//
+	// 高度中性：只替换这枚既有 badge 的文字，badge 行内元素个数不变，而 badge 行是
+	// 固定高度的 Group、测量层从不读标签文本（见 measure-subagent 的 `headerHeight`）。
+	const identityLabel = workerTier
+		? workerKind === "reviewer"
+			? labels.workerReviewer
+			: labels.workerExecutor
+		: agentType;
 	let top = 0;
 
 	// ── Header ──────────────────────────────────────────────────────────────
@@ -587,8 +765,8 @@ function SubagentInner({
 				<ThemeIcon size={THEME_ICON_SIZE} variant="light" color={agentBadgeColor} radius="sm">
 					<IconRobot size={10} />
 				</ThemeIcon>
-				<Badge size="xs" variant="light" color={agentBadgeColor}>
-					{agentType}
+				<Badge data-testid="subagent-agent-type" size="xs" variant="light" color={agentBadgeColor}>
+					{identityLabel}
 				</Badge>
 				{isBackground ? (
 					<Badge size="xs" variant="light" color="blue">
@@ -603,8 +781,22 @@ function SubagentInner({
 						{labels.takenOverBadge}
 					</Badge>
 				) : null}
+				{workerTier ? (
+					// 档位 badge 紧贴模型 badge：两者合起来正好回答"本轮用了哪个档位、
+					// 哪个模型"。识别不出的档位值不画（见 `workerTier` 的文档）。
+					<TierBadge tier={workerTier} labels={labels} />
+				) : null}
 				{model ? (
-					<SubagentModelBadge model={model} inheritance={modelInheritance} labels={labels} />
+					workerTier || modelWait || onSwitchWorkerModel ? (
+						<ModelBadge
+							model={model}
+							wait={modelWait ?? null}
+							onSwitch={onSwitchWorkerModel}
+							labels={labels}
+						/>
+					) : (
+						<SubagentModelBadge model={model} inheritance={modelInheritance} labels={labels} />
+					)
 				) : null}
 				{reasoningEffort ? (
 					<Badge data-testid="subagent-reasoning-effort" size="xs" variant="light" color="cyan">

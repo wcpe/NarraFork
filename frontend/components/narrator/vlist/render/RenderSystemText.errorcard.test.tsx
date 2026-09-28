@@ -452,3 +452,78 @@ describe("error notice card — the model probe shares the fix's button row", ()
 		unmount();
 	});
 });
+
+/**
+ * 编排 worker 的「换模型继续」（阶段 6）。
+ *
+ * 它加入的是同一条条件按钮行，因此走同一套约定：存不存在由**适配器**在测量期
+ * 决定（`canOfferOrchestrationModelSwitch`），渲染层只让画出来的按钮可点，并按
+ * `buttonIds` 绑定（第三个按钮意味着按下标绑定已经彻底不可用了）。
+ *
+ * "是不是编排 worker"由 shell 回答（它才拿得到 narrator 的 subagentType），
+ * 所以这里的替身只需要证明：适配器说没有 → 卡片上一个字都不多。
+ */
+describe("error notice card — 编排 worker 的换模型继续按钮", () => {
+	const SWITCH_LABEL = "换模型继续";
+	const switchCtx = {
+		canOfferOrchestrationModelSwitch: () => true,
+		labels: { switchWorkerModel: SWITCH_LABEL },
+	};
+
+	it("画成可读的按钮，并把点击路由到注入的处理器", () => {
+		const calls: string[] = [];
+		const { buttons, container, unmount } = renderErrorCard(
+			{ onMarkRetryable: () => {}, onDismiss: () => {}, onSwitchModel: () => calls.push("switch") },
+			undefined,
+			switchCtx,
+		);
+		expect(container.textContent).toContain(SWITCH_LABEL);
+		const button = buttons.find((b) => b.textContent?.includes(SWITCH_LABEL));
+		expect(button).toBeDefined();
+		act(() => button?.click());
+		expect(calls).toEqual(["switch"]);
+		unmount();
+	});
+
+	it("与另外两个按钮共用一行：第三个按钮只吃宽度，不动高度", () => {
+		const three = renderErrorCard({ onMarkRetryable: () => {}, onDismiss: () => {} }, undefined, {
+			canOfferProviderFix: () => true,
+			canOfferModelTest: () => true,
+			canOfferOrchestrationModelSwitch: () => true,
+			labels: {
+				disableImageGen: "关闭图像生成并重试",
+				testCurrentModel: "测试当前模型",
+				switchWorkerModel: SWITCH_LABEL,
+			},
+		});
+		const plain = renderErrorCard();
+		const c = MEASURE_SYSTEM_TEXT_CONSTANTS;
+		expect(three.measured.height - plain.measured.height).toBe(c.STACK_GAP + c.BUTTON_COMPACT_XS);
+		three.unmount();
+		plain.unmount();
+	});
+
+	it("非编排 worker（适配器说不）一个按钮都不画", () => {
+		// 这是"非编排 worker 不出现换模型入口"在卡片上的最终证据：适配器不给
+		// buttonId，卡片里就不存在这个按钮，注入的处理器也无处可点。
+		const { buttons, container, unmount } = renderErrorCard({
+			onMarkRetryable: () => {},
+			onDismiss: () => {},
+			onSwitchModel: () => {},
+		});
+		expect(buttons).toHaveLength(2);
+		expect(container.textContent).not.toContain(SWITCH_LABEL);
+		unmount();
+	});
+
+	it("处理器缺失时画成禁用，而不是看起来能点却没反应", () => {
+		const { buttons, unmount } = renderErrorCard(
+			{ onMarkRetryable: () => {}, onDismiss: () => {} },
+			undefined,
+			switchCtx,
+		);
+		const button = buttons.find((b) => b.textContent?.includes(SWITCH_LABEL));
+		expect(button?.hasAttribute("disabled")).toBe(true);
+		unmount();
+	});
+});

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildAggModelValue,
+	buildOrchestrationModelValue,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
@@ -49,6 +50,32 @@ describe("model menu selection", () => {
 		);
 		expect(modelMenuSelection("__agg__:group:a:model", []).targetValue).toBe("__agg__:group");
 	});
+	test("recognizes an orchestration value and keeps it intact", () => {
+		const value = buildOrchestrationModelValue("prof1");
+		const selection = modelMenuSelection(value, aggregations);
+		expect(selection.isOrchestration).toBe(true);
+		expect(selection.orchestrationProfileId).toBe("prof1");
+		// 编排值是会话的当前状态，不能被折叠成聚合根或跟随默认。
+		expect(selection.value).toBe(value);
+		expect(selection.baseValue).toBe(value);
+		expect(selection.targetValue).toBe(value);
+		expect(selection.members).toEqual([]);
+	});
+	test("does not mistake the other sentinels or concrete models for orchestration", () => {
+		for (const value of [
+			"a:model",
+			FOLLOW_DEFAULT_MODEL,
+			FOLLOW_SUMMARY_MODEL,
+			FOLLOW_PARENT_MODEL,
+			buildAggModelValue("group"),
+			// 前缀单独出现（没有 profileId）不是编排值：服务端同样不认。
+			"__orch__",
+		]) {
+			const selection = modelMenuSelection(value, aggregations);
+			expect(selection.isOrchestration).toBe(false);
+			expect(selection.orchestrationProfileId).toBeNull();
+		}
+	});
 });
 
 describe("model provider prefix for role rows", () => {
@@ -78,6 +105,11 @@ describe("global model role assignment", () => {
 		expect(canAssignGlobalModelRole(FOLLOW_DEFAULT_MODEL)).toBe(false);
 		expect(canAssignGlobalModelRole(FOLLOW_SUMMARY_MODEL)).toBe(false);
 		expect(canAssignGlobalModelRole(FOLLOW_PARENT_MODEL)).toBe(false);
+	});
+	test("rejects orchestration values", () => {
+		// 编排哨兵不是模型：写进全局槽位后全局默认/摘要都解析不出东西，
+		// 而错误会在会话装配时以另一个名字炸出来。
+		expect(canAssignGlobalModelRole(buildOrchestrationModelValue("prof1"))).toBe(false);
 	});
 	test("allows concrete models and aggregation roots", () => {
 		expect(canAssignGlobalModelRole("xiaomi:mimo-x-pro-preview")).toBe(true);

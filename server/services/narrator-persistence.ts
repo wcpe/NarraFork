@@ -1469,6 +1469,103 @@ const sqliteNarratorPersistence = {
 		);
 	},
 
+	/**
+	 * 为一次进行中的压缩追加「回落层」尝试（会话模型失败 → summaryModel 再试一次）。
+	 *
+	 * 为什么写进 `attempts` 而不是只打日志：压缩卡片、`GET /compact/:id` 与前端
+	 * 重试入口读的都是这里，只有写进来，"这次压缩到底是哪一层做的"才是用户看得见
+	 * 的事实；否则用户永远不知道回落有没有生效、自己配的 summaryModel 是不是白配。
+	 * 上一条尝试同时被标记为 failed 并带上它的错误，两次失败的原因因此都留在记录里。
+	 *
+	 * CAS 与 `finalizeCompactingMessage` 同样严格：只有「标记仍处于 compacting、
+	 * 最后一条尝试仍是我们启动的那一条」时才允许追加。取消/删除/重试之后的写入
+	 * 一律返回 null，由调用方放弃回落（退化为改动前的行为）。
+	 *
+	 * 被 fork 共享的消息（多个 ref）不改写：那会把追加的尝试泄漏给兄弟叙述者的
+	 * 记录。这种情况同样返回 null。
+	 */
+	async startCompactFallbackAttempt(
+		narratorId: string,
+		messageId: string,
+		model: string,
+		options: { expectedAttempt?: number; expectedSeq?: number; error?: string },
+	) {
+		const now = new Date().toISOString();
+		const selectedModel = model.trim() || settings.agent.summaryModel;
+		return withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					const ref = tx.query.narratorMessageRefs
+						.findFirst({
+							where: and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, messageId),
+							),
+							columns: { seq: true },
+						})
+						.sync();
+					if (!ref) return null;
+					const expectedSeq = options.expectedSeq ?? ref.seq;
+					if (expectedSeq !== ref.seq) return null;
+
+					const sharedRefs = tx
+						.select({ id: narratorMessageRefs.id })
+						.from(narratorMessageRefs)
+						.where(eq(narratorMessageRefs.messageId, messageId))
+						.all();
+					if (sharedRefs.length > 1) return null;
+
+					const existing = tx.query.narratorMessages
+						.findFirst({
+							where: and(
+								eq(narratorMessages.id, messageId),
+								eq(narratorMessages.narratorId, narratorId),
+								eq(narratorMessages.role, "system"),
+							),
+							columns: { contentJson: true },
+						})
+						.sync();
+					if (!existing) return null;
+					const blocks = Array.isArray(existing.contentJson) ? existing.contentJson : [];
+					const previous = blocks.map(parseCompactMessageBlock).find(Boolean);
+					if (!previous || previous.status !== "compacting") return null;
+					const latestAttempt = normalizeCompactAttempts(previous.attempts).at(-1);
+					if (!latestAttempt || latestAttempt.status !== "running") return null;
+					const expectedAttempt = options.expectedAttempt ?? latestAttempt.attempt;
+					if (expectedAttempt !== latestAttempt.attempt) return null;
+
+					const failedAttempt = finishCompactAttempt(previous, "failed", now, options.error);
+					const nextBlock = startCompactAttempt(failedAttempt, selectedModel, now);
+					const updated = tx
+						.update(narratorMessages)
+						.set({ contentJson: [nextBlock] })
+						.where(
+							and(
+								eq(narratorMessages.id, messageId),
+								eq(narratorMessages.narratorId, narratorId),
+								sql`json_extract(${narratorMessages.contentJson}, '$[0].status') = 'compacting'`,
+								sql`json_extract(${narratorMessages.contentJson}, '$[0].attempts[#-1].status') = 'running'`,
+								sql`json_extract(${narratorMessages.contentJson}, '$[0].attempts[#-1].attempt') = ${expectedAttempt}`,
+							),
+						)
+						.returning()
+						.get();
+					if (!updated) return null;
+
+					tx.update(narrators)
+						.set({
+							messageVersion: sql`${narrators.messageVersion} + 1`,
+							updatedAt: now,
+						})
+						.where(eq(narrators.id, narratorId))
+						.run();
+
+					return { ...updated, seq: ref.seq };
+				}),
+			{ label: "startCompactFallbackAttempt", maxRetries: 5 },
+		);
+	},
+
 	async prepareFailedCompactRetry(narratorId: string, messageId: string, model?: string) {
 		const now = new Date().toISOString();
 		const selectedModel = model?.trim() || settings.agent.summaryModel;

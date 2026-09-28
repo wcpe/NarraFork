@@ -25,6 +25,7 @@ import {
 	IconDeviceDesktop,
 	IconFolder,
 	IconFolderPlus,
+	IconGauge,
 	IconGitBranch,
 	IconInfoCircle,
 	IconMessages,
@@ -157,6 +158,20 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		icon: IconTextSize,
 		// Dock only: the panel's whole purpose is being visible BESIDE the transcript
 		// while a slider moves, which a modal drawer over the content cannot provide.
+		hosts: ["dock"],
+	},
+	orchestration: {
+		labelKey: "orchestrationPanelTitle",
+		icon: IconGauge,
+		/*
+		 * Dock only, and for the same structural reason as `appearance`: the detail it
+		 * adds over the status-bar popover is being visible BESIDE the transcript while
+		 * a run is in flight, which a drawer covering the content cannot provide. The
+		 * mobile `MobileToolPanelKind` union has no member for it, so declaring
+		 * `drawer` would put a row in the mobile overflow menu that opens nothing.
+		 * The popover remains reachable on mobile, so this is a scope decision rather
+		 * than a missing entry point.
+		 */
 		hosts: ["dock"],
 	},
 	lodlevel: {

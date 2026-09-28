@@ -74,6 +74,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	canOfferProviderFix?: (errorText: string) => boolean;
 	/** Whether an error card may offer the model probe (shares that measured row). */
 	canOfferModelTest?: (errorText: string) => boolean;
+	/** 编排 worker 的「换模型继续」是否可用（与上面两个按钮共用那条条件按钮行）。 */
+	canOfferOrchestrationModelSwitch?: (errorText: string) => boolean;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	/** First-frame layout of a live InlinePermission form (see AdapterContext). */
 	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;

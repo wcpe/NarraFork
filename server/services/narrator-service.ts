@@ -3154,6 +3154,8 @@ export const narratorService = {
 	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
 	prepareFailedCompactRetry:
 		narratorPersistence.prepareFailedCompactRetry.bind(narratorPersistence),
+	startCompactFallbackAttempt:
+		narratorPersistence.startCompactFallbackAttempt.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),
 	clearContext: narratorPersistence.clearContext.bind(narratorPersistence),
 	clearContextBefore: narratorPersistence.clearContextBefore.bind(narratorPersistence),

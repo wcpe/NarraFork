@@ -14,10 +14,9 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
-import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
+import { IconLock, IconLockOpen, IconShield, IconSitemap } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
 import {
 	AGG_MODEL_PREFIX,
@@ -43,10 +42,14 @@ import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
 import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
-import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
+import {
+	orchestrationSelectionName,
+	resolveModelMenuIntent,
+} from "../model/orchestration-selection";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
+import { OrchestrationStatusPopover } from "./OrchestrationStatusPopover";
 import { PermissionMenuContent } from "./PermissionMenuContent";
 import { createPlanReflectionStatusAction } from "./PlanReflectionStatusControl";
 import { ReasoningEffortMenuItems } from "./ReasoningEffortMenuItems";
@@ -82,10 +85,6 @@ export interface NarratorInteractionStatusBarProps {
 	/** The narrator object (read-only display of model/permissionMode/etc.). */
 	narrator: {
 		model?: string | null;
-		/** Follow/fallback decision when `model` is `__parent__`. */
-		modelInheritance?: SubagentModelInheritance | null;
-		/** `subagent:*` narrators may switch back to following their parent. */
-		variant?: string | null;
 		permissionMode?: string | null;
 		totalCostUsd?: number | null;
 		isAskInPassing?: boolean | null;
@@ -145,6 +144,16 @@ export interface NarratorInteractionStatusBarProps {
 		refreshProps: any;
 		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateModel.
 		mutation: any;
+		/**
+		 * 编排模式的进入/退出入口。它不能走 model.mutation：服务端拒绝把
+		 * `__orch__:` 哨兵交给普通 model PATCH。
+		 */
+		orchestration: {
+			// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateOrchestration.
+			mutation: any;
+			/** 子代理不能再派子代理，因此那里不显示编排分组。 */
+			isSubagent: boolean;
+		};
 		onEditDefaultModel: () => void;
 		onEditSummaryModel: () => void;
 		/** Promote a concrete model from the menu into the instance default/summary slots. */
@@ -250,7 +259,6 @@ export interface NarratorInteractionStatusBarProps {
 }
 
 export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBarProps) {
-	const inputMenu = useInputMenu();
 	const {
 		narrator,
 		narratorId,
@@ -346,8 +354,6 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				return workIndicator.quotaWaitText;
 			case "spec_task":
 				return workIndicator.currentSpecTask?.text ?? t("thinking");
-			case "reflecting":
-				return t("status_reflecting");
 			case "waiting":
 				return t("status_waiting");
 			case "planning":
@@ -396,6 +402,23 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	const followTooltip = inheritance
 		? (inheritance.reason ?? t("inheritance.followTooltip"))
 		: t("followParent");
+	// 当前是否处于编排模式，以及所处方案的显示名。用于在模型位上给出可见标识：
+	// 没有它，用户看到的只是一个不认识的模型名（或空白），不知道自己正被编排。
+	const orchestrationName = orchestrationSelectionName(narrator.model, model.allModels);
+	// 编排模式下的模型位取值：模型引用本身就是哨兵，交给触发器原样显示。
+	const orchestrationModelValue = orchestrationName !== null ? (narrator.model ?? "").trim() : null;
+
+	// 一次模型菜单选择的写入路径：编排方案走专用入口（服务端拒绝把哨兵交给普通
+	// model PATCH），普通模型直接写 model。处于编排模式时点具体模型不必先退出——
+	// 那次写入本身就把 model 从哨兵换掉，服务端会同步清掉会话的编排状态。
+	const selectModel = (value: string) => {
+		const intent = resolveModelMenuIntent(value);
+		if (intent.kind === "orchestration") {
+			model.orchestration.mutation.mutate({ id: narratorId, profileId: intent.profileId });
+			return;
+		}
+		model.mutation.mutate({ id: narratorId, model: intent.model });
+	};
 
 	return (
 		<>
@@ -403,67 +426,45 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				ownsHorizontalSafeArea={props.ownsHorizontalSafeArea}
 				borderTop={props.borderTop}
 			>
-				<Group
-					gap={6}
-					align="center"
-					wrap="nowrap"
-					style={{ flex: 1, minWidth: 0, overflow: "hidden" }}
-				>
-					{workIndicator.show && !isWorkspacePreview ? (
-						<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
-					) : (
-						<Group
-							gap={6}
-							wrap="nowrap"
+				{workIndicator.show && !isWorkspacePreview ? (
+					<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
+				) : (
+					<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+						<Box
+							w={8}
+							h={8}
 							style={{
-								flex: 1,
-								minWidth: 0,
-								overflow: "hidden",
+								borderRadius: "50%",
+								backgroundColor: statusRegistry.accentVar(workIndicator.statusBarDisplay, "filled"),
+								flexShrink: 0,
 							}}
-						>
-							<Box
-								w={8}
-								h={8}
-								style={{
-									borderRadius: "50%",
-									backgroundColor: statusRegistry.accentVar(
-										workIndicator.statusBarDisplay,
-										"filled",
-									),
-									flexShrink: 0,
-								}}
+						/>
+						<TruncatedText size="xs" c="dimmed" text={t(workIndicator.statusBarDisplay.labelKey)} />
+						{tasks.supported && tasks.buttonEnabled && (
+							<BackgroundTasksStatusButton
+								runningCount={tasks.runningCount}
+								onOpen={tasks.onOpenPanel}
 							/>
-							<TruncatedText
+						)}
+						{workIndicator.compactFailure && !workIndicator.isCompacting && (
+							<Text
 								size="xs"
-								c="dimmed"
-								text={t(workIndicator.statusBarDisplay.labelKey)}
+								c="red"
+								style={{ flexShrink: 0 }}
+								title={workIndicator.compactFailure.error || undefined}
+							>
+								· {t("compactFailed")}
+							</Text>
+						)}
+						{workIndicator.turnElapsedText && !isWorkspacePreview && (
+							<TurnElapsedTime
+								text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
+								startedAtLabel={workIndicator.turnStartedAtLabel}
+								isMobile={isMobileViewport}
 							/>
-							{tasks.supported && tasks.buttonEnabled && (
-								<BackgroundTasksStatusButton
-									runningCount={tasks.runningCount}
-									onOpen={tasks.onOpenPanel}
-								/>
-							)}
-							{workIndicator.compactFailure && !workIndicator.isCompacting && (
-								<Text
-									size="xs"
-									c="red"
-									style={{ flexShrink: 0 }}
-									title={workIndicator.compactFailure.error || undefined}
-								>
-									· {t("compactFailed")}
-								</Text>
-							)}
-							{workIndicator.turnElapsedText && !isWorkspacePreview && (
-								<TurnElapsedTime
-									text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
-									startedAtLabel={workIndicator.turnStartedAtLabel}
-									isMobile={isMobileViewport}
-								/>
-							)}
-						</Group>
-					)}
-				</Group>
+						)}
+					</Group>
+				)}
 				{workIndicator.show && !isWorkspacePreview && workIndicator.turnElapsedText && (
 					<TurnElapsedTime
 						text={workIndicator.turnElapsedText}
@@ -607,7 +608,15 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									<NarratorStatusToolbar
 										leading={
 											<Group gap={6} wrap="nowrap">
-												<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
+												<Tooltip
+													label={
+														followsParent
+															? followTooltip
+															: orchestrationModelValue !== null
+																? t("orchestrationModeTooltip")
+																: t("modelTooltip")
+													}
+												>
 													<Menu
 														position="top-end"
 														{...inputMenu.menuProps}
@@ -623,41 +632,58 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															<NativeSelect
 																{...inputMenu.targetProps}
 																size="xs"
+																leftSection={
+																	orchestrationModelValue !== null ? (
+																		<IconSitemap size={14} />
+																	) : undefined
+																}
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
 																data={
 																	followsParent
 																		? [{ value: FOLLOW_PARENT_MODEL, label: followLabel }]
-																		: model.allModels
-																				.filter((m) => {
-																					const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																					const agg = parseAggModelValue(raw);
-																					return (
-																						m.value ===
-																						(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
-																					);
-																				})
-																				.map((m) => ({
-																					value: m.value,
-																					label:
-																						m.value === FOLLOW_DEFAULT_MODEL
-																							? t("followDefault", {
-																									model: model.defaultModelValue,
-																								})
-																							: m.provider === "__agg__"
-																								? `⚡ ${m.label}`
-																								: m.provider
-																									? `${m.provider}:${m.label}`
-																									: m.label,
-																				}))
+																		: orchestrationModelValue !== null
+																			? [
+																					{
+																						value: orchestrationModelValue,
+																						label: t("orchestrationModelLabel", {
+																							name: orchestrationName ?? "",
+																						}),
+																					},
+																				]
+																			: model.allModels
+																					.filter((m) => {
+																						const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																						const agg = parseAggModelValue(raw);
+																						return (
+																							m.value ===
+																							(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																						);
+																					})
+																					.map((m) => ({
+																						value: m.value,
+																						label:
+																							m.value === FOLLOW_DEFAULT_MODEL
+																								? t("followDefault", {
+																										model: model.defaultModelValue,
+																									})
+																								: m.provider === "__agg__"
+																									? `⚡ ${m.label}`
+																									: m.provider
+																										? `${m.provider}:${m.label}`
+																										: m.label,
+																					}))
 																}
-																value={(() => {
-																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																	const agg = parseAggModelValue(raw);
-																	// For pinned aggregation, map back to the base agg value
-																	if (agg) return `${AGG_MODEL_PREFIX}${agg.aggId}`;
-																	return raw;
-																})()}
+																value={
+																	orchestrationModelValue ??
+																	(() => {
+																		const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																		const agg = parseAggModelValue(raw);
+																		// For pinned aggregation, map back to the base agg value
+																		if (agg) return `${AGG_MODEL_PREFIX}${agg.aggId}`;
+																		return raw;
+																	})()
+																}
 																onChange={() => {}}
 																onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
 																style={{ pointerEvents: "auto" }}
@@ -680,11 +706,17 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																canFollowParent={canFollowParent}
 																inheritance={narrator.modelInheritance}
 																totalCostUsd={narrator.totalCostUsd}
-																onSelect={(v) =>
-																	model.mutation.mutate({ id: narratorId, model: v })
-																}
+																onSelect={selectModel}
 																onShowPrice={setPriceModel}
 																providerLabels={model.providerLabels}
+																hideOrchestration={model.orchestration.isSubagent}
+																onExitOrchestration={() =>
+																	model.orchestration.mutation.mutate({
+																		id: narratorId,
+																		profileId: null,
+																	})
+																}
+																orchestrationPending={model.orchestration.mutation.isPending}
 																onEditDefaultModel={model.onEditDefaultModel}
 																onEditSummaryModel={model.onEditSummaryModel}
 																onSetAsDefaultModel={model.onSetAsDefaultModel}
@@ -696,13 +728,17 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 														</Menu.Dropdown>
 													</Menu>
 												</Tooltip>
+												{/* 编排状态详情：与模型位相邻，因为"在编排"正由模型位表达
+											    （见 orchestrationModelLabel）。仅编排会话可见。 */}
+												{orchestrationModelValue !== null && (
+													<OrchestrationStatusPopover narratorId={narratorId} t={t} />
+												)}
 
 												{/* Reasoning Effort (Codex + Anthropic providers) */}
 												{reasoning.supported && (
-													<Menu {...inputMenu.menuProps} position="top-end">
+													<Menu position="top-end">
 														<Menu.Target>
 															<NativeSelect
-																{...inputMenu.targetProps}
 																size="xs"
 																data={[
 																	{
@@ -752,7 +788,6 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												>
 													{narrator.isAskInPassing ? (
 														<NativeSelect
-															{...inputMenu.targetProps}
 															size="xs"
 															leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
 															data={[{ value: "readOnly", label: t("perm_readOnly") }]}
@@ -762,10 +797,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															style={{ pointerEvents: "auto", opacity: 0.6 }}
 														/>
 													) : (
-														<Menu {...inputMenu.menuProps} position="top-end">
+														<Menu position="top-end">
 															<Menu.Target>
 																<NativeSelect
-																	{...inputMenu.targetProps}
 																	size="xs"
 																	leftSection={
 																		PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
@@ -907,9 +941,17 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 								<NarratorStatusToolbar
 									leading={
 										<>
-											<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
+											<Tooltip
+												label={
+													followsParent
+														? followTooltip
+														: orchestrationModelValue !== null
+															? t("orchestrationModeTooltip")
+															: t("modelTooltip")
+												}
+											>
 												<Menu
-													position="top-end"
+													position="bottom-end"
 													withinPortal
 													{...inputMenu.menuProps}
 													{...MODEL_MENU_POSITIONING}
@@ -921,10 +963,26 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												>
 													<Menu.Target>
 														<ActionIcon
-															variant="subtle"
+															// 编排模式用 indigo 实心触发态，让「正被编排」在移动端
+															// 一眼可辨——窄屏放不下方案名，只剩这一个信号。
+															variant={orchestrationModelValue !== null ? "light" : "subtle"}
 															size="sm"
-															color={inheritance?.fallback ? "yellow" : "gray"}
-															aria-label={followsParent ? followLabel : t("modelTooltip")}
+															color={
+																orchestrationModelValue !== null
+																	? "indigo"
+																	: inheritance?.fallback
+																		? "yellow"
+																		: "gray"
+															}
+															aria-label={
+																followsParent
+																	? followLabel
+																	: orchestrationModelValue !== null
+																		? t("orchestrationModelLabel", {
+																				name: orchestrationName ?? "",
+																			})
+																		: t("modelTooltip")
+															}
 															{...inputMenu.targetProps}
 														>
 															<Text size="xs" fw={600}>
@@ -933,6 +991,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																		return (inheritance?.model ?? t("followParent"))
 																			.charAt(0)
 																			.toUpperCase();
+																	if (orchestrationModelValue !== null)
+																		return (
+																			(orchestrationName || "?").charAt(0).toUpperCase() || "?"
+																		);
 																	if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
 																		return "D";
 																	const m = model.allModels.find((x) => x.value === narrator.model);
@@ -958,9 +1020,18 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															canFollowParent={canFollowParent}
 															inheritance={narrator.modelInheritance}
 															totalCostUsd={narrator.totalCostUsd}
-															onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
+															onSelect={selectModel}
 															onShowPrice={setPriceModel}
+															label={t("modelTooltip")}
 															providerLabels={model.providerLabels}
+															hideOrchestration={model.orchestration.isSubagent}
+															onExitOrchestration={() =>
+																model.orchestration.mutation.mutate({
+																	id: narratorId,
+																	profileId: null,
+																})
+															}
+															orchestrationPending={model.orchestration.mutation.isPending}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
 															onSetAsDefaultModel={model.onSetAsDefaultModel}
@@ -972,17 +1043,20 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 													</Menu.Dropdown>
 												</Menu>
 											</Tooltip>
+											{/* 编排状态详情（移动端同款）：窄屏同样需要能判断池子配得合不合理。 */}
+											{orchestrationModelValue !== null && (
+												<OrchestrationStatusPopover narratorId={narratorId} t={t} />
+											)}
 
 											{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 											{reasoning.supported && (
-												<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
+												<Menu position="bottom-end" withinPortal>
 													<Menu.Target>
 														<ActionIcon
 															variant="subtle"
 															color="gray"
 															size="sm"
 															aria-label={t("reasoningEffort")}
-															{...inputMenu.targetProps}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
@@ -1047,14 +1121,13 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 														{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
 													</ActionIcon>
 												) : (
-													<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
+													<Menu position="bottom-end" withinPortal>
 														<Menu.Target>
 															<ActionIcon
 																variant="subtle"
 																color="gray"
 																size="sm"
 																aria-label={t("permissionMode")}
-																{...inputMenu.targetProps}
 															>
 																{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
 																	<IconShield size={16} />
@@ -1143,9 +1216,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
  * JSX flatter; it reads the same grouped props.
  */
 function UnstyledButtonWorkIndicator(
-	props: NarratorInteractionStatusBarProps & {
-		workIndicatorText: string;
-	},
+	props: NarratorInteractionStatusBarProps & { workIndicatorText: string },
 ) {
 	const { workIndicator, queue, t, workIndicatorText } = props;
 	return (
@@ -1192,7 +1263,7 @@ function UnstyledButtonWorkIndicator(
 				)}
 				{/* The current task text can be long (spec task titles especially), so
 				    reveal the full string on hover/tap when the row clips it. */}
-				<TruncatedText size="xs" lh="14px" c={workIndicator.color} text={workIndicatorText} />
+				<TruncatedText size="xs" c={workIndicator.color} text={workIndicatorText} />
 				{((queue.positionValue != null && queue.positionValue > 0) || queue.messageValue) && (
 					<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 						·{" "}

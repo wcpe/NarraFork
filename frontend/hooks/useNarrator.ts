@@ -1230,6 +1230,27 @@ export function useUpdateModel() {
 	});
 }
 
+/**
+ * 进入/退出编排模式（`profileId: null` 为退出）。
+ *
+ * 不能复用 useUpdateModel：服务端拒绝把 `__orch__:` 哨兵交给 PATCH /:id/model，
+ * 因为那条路径绕过了「方案存在且启用、配了编制者模型、会话是主叙述者」的校验。
+ */
+export function useUpdateOrchestration() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, profileId }: { id: string; profileId: string | null }) =>
+			api.updateNarratorOrchestration(id, profileId),
+		onSuccess: (_data, vars) => {
+			// 退出编排模式会换掉会话的模型，原模型的「暂不可用」等待条件随之失效，
+			// 与 useUpdateModel 同理需要收起那条常驻通知。
+			if (vars.profileId === null) notifications.hide(`model-unavailable-${vars.id}`);
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+		},
+	});
+}
+
 export function useUpdateCwd() {
 	const qc = useQueryClient();
 	return useMutation({

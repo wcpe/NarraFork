@@ -5,7 +5,7 @@ import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
 import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
-import { IS_WINDOWS } from "../lib/platform";
+import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
 	getPlanModeSystemReminder,
@@ -53,6 +53,22 @@ export interface BuildPromptOptions {
 	defaultDeviceId?: string | null;
 	/** Whether the NarraFork server may be selected as an execution target. */
 	allowLocalExecution?: boolean;
+	/**
+	 * 编排模式下的编制者提示词（已按 locale 渲染好）。
+	 *
+	 * 由调用方按当前会话是否处于编排模式决定是否传入——本函数不认识编排状态，
+	 * 也就不会把"如何判断"实现第二遍。
+	 */
+	orchestrationPrompt?: string;
+	/**
+	 * 当前会话是否是编排模式的编制者。
+	 *
+	 * 由调用方显式传入（与 `orchestrationPrompt` 同源），本函数不从工具面或提示词文本
+	 * 反推编排状态。编制者的工具面里没有 Bash / Glob / Grep，Write / Edit 也只对
+	 * `spec://` 生效，因此 cwd 段与 Execution Devices 段必须换成"不点名这些工具"的版本，
+	 * 否则提示词会教它走一条它做不到的路径。**省略（或 false）时输出与改动前逐字相同。**
+	 */
+	orchestratorMode?: boolean;
 }
 
 export interface BuildPromptResult {
@@ -113,6 +129,8 @@ export async function buildEffectiveSystemPrompt(
 		devices,
 		defaultDeviceId,
 		allowLocalExecution = true,
+		orchestrationPrompt,
+		orchestratorMode = false,
 	} = options;
 
 	// Fall back to global default system prompt when basePrompt is null
@@ -148,10 +166,14 @@ export async function buildEffectiveSystemPrompt(
 		// sections used to say "Shell" whenever IS_WINDOWS, which contradicted the
 		// registered tool name on the common Windows setup (Git Bash) and made the
 		// model alternate between two names, one of which does not exist.
-		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (${BASH_TOOL_NAME}, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in ${BASH_TOOL_NAME} commands — it is redundant.`;
+		// 编制者不跑命令、不改项目文件，所以这段既不能点名它没有的工具，
+		// 也不需要下面的平台 shell 规则（那些规则全部围绕"用 Bash 跑什么"）。
+		let cwdSection = orchestratorMode
+			? `## Current Working Directory\n\n\`${cwd}\`\n\nThis is the working directory your dispatches run in. Every tool you have resolves its paths against it.`
+			: `## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (${BASH_TOOL_NAME}, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in ${BASH_TOOL_NAME} commands — it is redundant.`;
 
 		// Windows Git Bash: warn about MSYS2 path mangling and forbid cmd builtins
-		if (IS_WINDOWS && shellInfo.loginWrap) {
+		if (!orchestratorMode && IS_WINDOWS && shellInfo.loginWrap) {
 			cwdSection += `\n\nCRITICAL — Windows Git Bash Rules:
 - The ${BASH_TOOL_NAME} tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
 - NEVER use Windows cmd builtins or utilities in the ${BASH_TOOL_NAME} tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
@@ -161,13 +183,17 @@ export async function buildEffectiveSystemPrompt(
 		}
 
 		// Windows PowerShell guidance
-		if (IS_WINDOWS && shellInfo.type === "powershell") {
+		if (!orchestratorMode && IS_WINDOWS && shellInfo.type === "powershell") {
 			cwdSection += `\n\nCRITICAL — Windows PowerShell Rules:
 - The ${BASH_TOOL_NAME} tool uses PowerShell on this system (the tool name is still ${BASH_TOOL_NAME}). Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
 - NEVER use Windows cmd builtins: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`. They may behave unexpectedly in PowerShell.
 - Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands whenever possible.`;
 		}
 
+		// On Windows, forbid WSL suggestions unless --wsl=true
+		if (!orchestratorMode && IS_WINDOWS && !isWslAllowed()) {
+			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows.`;
+		}
 		prompt = `${base}${sep}${cwdSection}`;
 	}
 
@@ -197,11 +223,16 @@ export async function buildEffectiveSystemPrompt(
 				onlineDevices.length > 0
 					? `Available remote devices:\n${deviceLines.join("\n")}`
 					: "Available remote devices: none currently online.";
+			// 编制者没有 SwitchDevice（见 ORCHESTRATOR_TOOLS），所以恢复建议必须换成
+			// "在这一次调用上显式传 device"，否则这条警告会教它调一个不存在的工具。
+			const localRecovery = orchestratorMode
+				? `Pass \`device: "local"\` on the specific call instead.`
+				: `Use SwitchDevice with \`device: "local"\` before running local file or command tools.`;
 			const unavailableWarning = defaultUnavailable
 				? `\n\nWARNING: The configured default remote device \`${defaultDeviceId}\` is unknown or offline. ` +
 					`Tool calls that omit \`device\` will fail and will NOT fall back to local execution. ` +
 					(allowLocalExecution
-						? `Use SwitchDevice with \`device: "local"\` before running local file or command tools.`
+						? localRecovery
 						: `Select another listed online remote device; local execution is forbidden by runtime policy.`)
 				: "";
 			// Prefer an online device for the example; fall back to the (possibly
@@ -221,17 +252,27 @@ export async function buildEffectiveSystemPrompt(
 					: "using a listed remote device id. Only listed remote device ids are allowed; " +
 						"the local server is forbidden by runtime policy.";
 			}
-			const deviceSection =
-				`## Execution Devices\n\n` +
-				`File and command tools (Read, Write, Edit, Glob, Grep, ${BASH_TOOL_NAME}) ` +
-				`run only on their selected execution target.\n\n` +
-				`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
-				`${availabilityText}\n\n` +
-				`- By default, tools run on the current default target.\n` +
-				`- To run a single operation on a specific machine, pass the \`device\` parameter ${perCallExample}\n` +
-				`- To change the default target for subsequent tools, use the SwitchDevice tool.\n` +
-				`- Remote routing failures never fall back to the server's local filesystem.\n` +
-				`- Paths and commands are interpreted on the selected target's filesystem.`;
+			// 编制者只能对 `Read` 指定设备（Write/Edit 只写 spec://，不上设备），
+			// 而且它没有 SwitchDevice，所以这一段必须按它的实际工具面重写。
+			const deviceSection = orchestratorMode
+				? `## Execution Devices\n\n` +
+					`\`Read\` runs only on the execution target you select for it; the executors you dispatch run on the target they are given.\n\n` +
+					`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
+					`${availabilityText}\n\n` +
+					`- By default, operations run on the current default target.\n` +
+					`- To read a single file from a specific machine, pass the \`device\` parameter ${perCallExample}\n` +
+					`- Remote routing failures never fall back to the server's local filesystem.\n` +
+					`- Paths are interpreted on the selected target's filesystem.`
+				: `## Execution Devices\n\n` +
+					`File and command tools (Read, Write, Edit, Glob, Grep, ${BASH_TOOL_NAME}) ` +
+					`run only on their selected execution target.\n\n` +
+					`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
+					`${availabilityText}\n\n` +
+					`- By default, tools run on the current default target.\n` +
+					`- To run a single operation on a specific machine, pass the \`device\` parameter ${perCallExample}\n` +
+					`- To change the default target for subsequent tools, use the SwitchDevice tool.\n` +
+					`- Remote routing failures never fall back to the server's local filesystem.\n` +
+					`- Paths and commands are interpreted on the selected target's filesystem.`;
 			prompt = `${base}${sep}${deviceSection}`;
 		}
 	}
@@ -240,7 +281,7 @@ export async function buildEffectiveSystemPrompt(
 	{
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}${getDynamicSpecSystemReminder(locale)}`;
+		prompt = `${base}${sep}${getDynamicSpecSystemReminder(locale, { orchestrator: orchestratorMode })}`;
 	}
 
 	// 3. Inject project instructions. AGENTS.override.md is a local-only override
@@ -313,6 +354,15 @@ export async function buildEffectiveSystemPrompt(
 			planAllowInlinePlan !== false,
 			planFileBytes,
 		)}`;
+	}
+
+	// 6. Inject the orchestrator instructions (orchestration mode only).
+	// 放在最后：它是本会话最具约束性的一段角色说明，挤在中间会被后面的
+	// 通用段落（语言、文件引用约定）冲淡。
+	if (orchestrationPrompt) {
+		const base = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}${orchestrationPrompt}`;
 	}
 
 	return { prompt, usedCompactSummary, ...(summaryRange ? { summaryRange } : {}) };

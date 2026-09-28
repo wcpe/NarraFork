@@ -34,6 +34,8 @@ function options(): UseHeaderToolbarOptions {
 		onOpenTerminalPanel: undefined,
 		browserSessionsSupported: true,
 		executionDevicesQuery: { data: { devices: [] } },
+		// 默认开启：本文件考察的是工具栏的分区与激活，不是"编排面板该不该出现"。
+		orchestrationAvailable: true,
 		mobileTasksOpen: false,
 		mobileToolPanel: null,
 		detailsOpened: false,

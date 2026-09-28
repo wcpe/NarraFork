@@ -342,6 +342,24 @@ export interface SubagentCardData {
 	isTakenOver?: boolean;
 	/** Extra model badge label. Height-neutral (same row). */
 	model?: string;
+	/**
+	 * 编排 worker 的档位 badge（chore/quick/medium/heavy）。Height-neutral：它与
+	 * 模型 badge 同处那条固定高度的 badge 行。测量层不读它，只是让载荷的字段在
+	 * 类型上如实可见（非编排子代理没有值）。
+	 */
+	workerTier?: string;
+	/**
+	 * 编排 worker 的角色（executor / reviewer）。Height-neutral，与 `workerTier` 同理：
+	 * 测量层不读它，只让载荷字段在类型上如实可见。
+	 *
+	 * 它同时进 `subagentRevision` 的缓存键——身份 chip 画的是角色而不是类型名，角色
+	 * 变了这句话就得重画。
+	 *
+	 * 补这个字段的理由不是"顺手"：适配器一直在发它、registry 一直在读它，只有类型上
+	 * 没有它。于是"载荷里有、extra 里有、组件却收不到"这条缝既不会被类型检查发现，
+	 * 也不会被任何一个守卫发现——编排卡片因此长期画着工具名 `Agent`。
+	 */
+	workerKind?: "executor" | "reviewer";
 	/** Extra thinking-effort badge label. Height-neutral (same row). */
 	reasoningEffort?: string;
 	/** Description line (collapsed: truncated single line; expanded: wraps). */

@@ -69,6 +69,29 @@ export interface ModelCatalogSettings {
 		pricingOverrides: unknown;
 	};
 }
+/**
+ * 只保留**满足 schema 要求**的字符串条目。
+ *
+ * `catalog.schema.json` 对 `name` / `family` / `notes` 的规定是"存在即非空字符串"
+ * （`{type:"string", minLength:1}`，三者都不在 `required` 里）。因此：
+ *  - "没有值"的正确表达是**不写这个键**，而不是写一个值为 `undefined` 的键——二者在
+ *    JSON 往返、`Object.keys`、以及任何按存在性判断的下游代码里并不等价；
+ *  - **空串必须一并丢弃**：`card.displayName ?? base?.name` 这类 `??` 只拦
+ *    `null` / `undefined`，尾随的空串会原样写进去，随后被校验器判为
+ *    `Invalid string`（空串让 `length < minLength` 成立）。
+ *
+ * 两者都覆盖，才是与 schema 一致的判定。
+ */
+function pickDefinedStrings<T extends Record<string, string | undefined>>(
+	values: T,
+): Partial<Record<keyof T, string>> {
+	const result: Partial<Record<keyof T, string>> = {};
+	for (const [key, value] of Object.entries(values)) {
+		if (typeof value === "string" && value.length > 0) result[key as keyof T] = value;
+	}
+	return result;
+}
+
 const bundled = decodeCatalog(bundledJSON);
 const directory = resolve(getNarraforkHome(), "model-catalog");
 const cachePath = resolve(directory, "snapshots.json");
@@ -305,12 +328,16 @@ export function bindModelCatalogSettings(settings: NarraForkSettings, save: () =
 			local.models.push({
 				...(base ?? { id }),
 				metadata: {},
-				rawMetadata: undefined, // Identity edits must not pin the preset's complete source.
-				// Legacy editors allowed empty optional labels; the catalog requires
-				// non-empty strings. Treat blanks as unset, retaining preset identity.
-				name: card.displayName?.trim() || base?.name,
-				family: card.family?.trim() || base?.family,
-				notes: card.notes?.trim() || base?.notes,
+			rawMetadata: undefined, // Identity edits must not pin the preset's complete source.
+			// 只在确实有值时才写这些可选字段；空串也会被丢弃。
+			// 不能写成 `name: card.displayName ?? base?.name`：`??` 只拦 null/undefined，
+			// 所以"两者都不存在 → undefined"与"存在空串 → ''"都会被原样写进对象，
+			// 而 schema 要求这三个字段存在即非空字符串。详见 pickDefinedStrings 的说明。
+			...pickDefinedStrings({
+				name: card.displayName ?? base?.name,
+				family: card.family ?? base?.family,
+				notes: card.notes ?? base?.notes,
+			}),
 				matches: {
 					...base?.matches,
 					...(card.aliases ? { aliases: card.aliases } : {}),
@@ -843,9 +870,16 @@ export function saveLegacyModelCard(key: string, card: ModelCard | null, reset =
 					...(base ?? existing ?? { id }),
 					metadata: applyMetadataPatch(existing?.metadata ?? {}, { reset: legacyPaths }),
 					rawMetadata: existing?.rawMetadata,
-					name: card.displayName,
-					family: card.family,
-					notes: card.notes,
+					// 与上面卡片迁移同一条原则：`card` 的这几个字段是可选的，
+					// 无条件写会把 `...(base ?? existing)` 里已有的合法值**覆盖成
+					// undefined**（或空串），随后被 schema 判为 Invalid string。
+					// 这里是"卡片回写本地层"的路径，卡片数据本就来自同一个界面，
+					// 因此是同类崩溃更可能的触发源。
+					...pickDefinedStrings({
+						name: card.displayName ?? base?.name ?? existing?.name,
+						family: card.family ?? base?.family ?? existing?.family,
+						notes: card.notes ?? base?.notes ?? existing?.notes,
+					}),
 					matches: {
 						ids: base?.matches?.ids,
 						aliases: card.aliases,

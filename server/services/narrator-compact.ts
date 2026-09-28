@@ -7,17 +7,20 @@ import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
+import type { SummaryRetryInfo } from "../lib/agent";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs, resolveDefaultReasoningEffort, settings } from "../lib/settings";
+import { getAutoCompactKeepPairs, resolveDefaultReasoningEffort } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	appendLiveCompactDelta,
 	finishLiveCompactProgress,
+	retargetLiveCompactModel,
 	startLiveCompactProgress,
 } from "./compact-live-state";
+import { resolveCompactModelLayers } from "./compact-model-selection";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
@@ -86,6 +89,8 @@ interface CompactProgressReporter {
 	 * say "retrying (N)" instead of an unexplained 0-char spinner.
 	 */
 	reportRetry: (retryCount: number, error: string) => void;
+	/** 换用回落模型时调用，让进度事件与实时详情都指向真正在工作的模型。 */
+	setModel: (model: string, reasoningEffort?: string) => void;
 	/** Stop progress ticks while final persistence completes. */
 	finish: () => void;
 	/** Close the on-demand text stream after the final marker state is persisted. */
@@ -277,9 +282,12 @@ export function createCompactProgressReporter(options: {
 	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
 	// last published snapshot (the throttled accumulator does not expose one).
 	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
+	// 当前生效的模型：压缩可能会从中途换用回落模型，因此不直接用 options 里的初值。
+	let currentModel = options.model;
+	let currentReasoningEffort = options.reasoningEffort;
 	startLiveCompactProgress(options.messageId, {
-		model: options.model ?? "",
-		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+		model: currentModel ?? "",
+		...(currentReasoningEffort ? { reasoningEffort: currentReasoningEffort } : {}),
 		startedAt: options.startedAt ?? new Date().toISOString(),
 	});
 	const reporter = createThrottledProgressReporter((snapshot) => {
@@ -292,8 +300,8 @@ export function createCompactProgressReporter(options: {
 			thinkingChars: snapshot.thinkingChars,
 			outputChars: snapshot.outputChars,
 			mode: options.mode,
-			...(options.model ? { model: options.model } : {}),
-			...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+			...(currentModel ? { model: currentModel } : {}),
+			...(currentReasoningEffort ? { reasoningEffort: currentReasoningEffort } : {}),
 			...(options.startedAt ? { startedAt: options.startedAt } : {}),
 			...(options.isSegment ? { isSegment: true } : {}),
 		});
@@ -342,6 +350,11 @@ export function createCompactProgressReporter(options: {
 		onTextDelta: addOutput,
 		onReasoningDelta: addThinking,
 		reportRetry,
+		setModel: (model: string, reasoningEffort?: string) => {
+			currentModel = model;
+			currentReasoningEffort = reasoningEffort;
+			retargetLiveCompactModel(options.messageId, model, reasoningEffort);
+		},
 		finish: () => reporter.finish(),
 		close: (status: "compacted" | "failed") => {
 			if (closed) return;
@@ -373,6 +386,11 @@ function compactTriggerFor(
 	mode: CompactMode,
 ): CompactMessageTrigger {
 	return options?.trigger ?? (mode === "background" ? "background" : "manual");
+}
+
+/** 把一个压缩失败的 cause 压成一行可读文本，用于把两层的错误拼进同一条报错。 */
+function compactErrorText(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
 }
 
 function compactAttemptNumber(message: unknown): number | undefined {
@@ -944,7 +962,11 @@ async function doRunCustomCompact({
 	options,
 	hooks,
 }: DoRunCustomCompactArgs): Promise<boolean> {
-	const selectedModel = options?.model?.trim() || settings.agent.summaryModel;
+	// 压缩默认先用**会话自己的模型**：用户遇到"上下文爆掉"的往往就是那条会话，
+	// 用会话模型压缩才不会出现"压缩模型装得下、会话模型装不下"的错配。显式
+	// override 仍然优先，`summaryModel` 退居回落层（见 compact-model-selection）。
+	const layers = await resolveCompactModelLayers(narratorId, options?.model);
+	const selectedModel = layers.primary.model;
 	const replacementFields = compactReplacementFields(options);
 	const isRetry = options?.preparedRetryMessage != null;
 	logger.info("Starting custom compact", {
@@ -952,6 +974,8 @@ async function doRunCustomCompact({
 		beforeMessageId,
 		mode,
 		model: selectedModel,
+		modelSource: layers.primary.source,
+		fallbackModel: layers.fallback?.model,
 		retryingMessageId: options?.reuseFailedMessageId,
 	});
 
@@ -1035,23 +1059,96 @@ async function doRunCustomCompact({
 		// internal backoff chain and the whole-chunk retry in narrator-context), so
 		// the UI's "retrying (N)" ordinal never resets or goes backwards mid-run.
 		let retryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
-			narratorId,
-			locale,
-			messages,
-			signal,
-			selectedModel,
-			compactProgress.onTextDelta,
-			compactProgress.onReasoningDelta,
-			// Chunk boundaries are the only liveness signal for a summary model that
-			// does not stream, so a multi-chunk cascade must not read as a stall.
-			hooks?.beat,
-			(info) => {
-				retryCount += 1;
-				compactProgress.reportRetry(retryCount, info.error);
-			},
-			options?.userId,
-		);
+		const onRetryScheduled = (info: SummaryRetryInfo) => {
+			retryCount += 1;
+			compactProgress.reportRetry(retryCount, info.error);
+		};
+		// 两层共用同一个提示词与同一份输入，唯一差别是模型。这里的 `messages` 已在
+		// 上面取好并复用，`narrator-context` 会按**目标模型**的窗口把输入切成若干
+		// 块，因此换模型不会改变"喂进去的是什么"。
+		const runSummary = (model: string) =>
+			narratorContext.generateCompactSummary(
+				narratorId,
+				locale,
+				messages,
+				signal,
+				model,
+				compactProgress.onTextDelta,
+				compactProgress.onReasoningDelta,
+				// Chunk boundaries are the only liveness signal for a summary model that
+				// does not stream, so a multi-chunk cascade must not read as a stall.
+				hooks?.beat,
+				onRetryScheduled,
+				options?.userId,
+			);
+
+		// 最多两层，不递归、不循环：第一层失败才回落，回落再失败就是失败。
+		let usedModel = selectedModel;
+		let usedLayer: "primary" | "fallback" = "primary";
+		let summary: string;
+		let contextPercent: number | undefined;
+		try {
+			({ summary, contextPercent } = await runSummary(selectedModel));
+		} catch (err) {
+			// 用户取消 / 看门狗超时都会让 signal 处于中止态。此时不能回落：这次运行
+			// 正在被拆解，再发一次请求只会拖住它，而且成功也 finalize 不了。
+			if (!layers.fallback || signal?.aborted || isCompactAbortError(err)) throw err;
+			const fallback = layers.fallback;
+			logger.warn("Compact failed with the primary model; retrying once with the fallback", {
+				narratorId,
+				primaryModel: selectedModel,
+				primarySource: layers.primary.source,
+				fallbackModel: fallback.model,
+				error: String(err),
+			});
+			// 把回落写进压缩记录（`attempts` 追加一条），否则"这次压缩到底是哪一层
+			// 做的"在卡片与 `GET /compact/:id` 上完全看不出来。写不进去说明标记已被
+			// 取消/删除，这种情况放弃回落。
+			const fallbackMarker = await narratorService.startCompactFallbackAttempt(
+				narratorId,
+				compactingMsg.id,
+				fallback.model,
+				{
+					expectedAttempt,
+					expectedSeq,
+					error: err instanceof Error ? err.message : String(err),
+				},
+			);
+			if (!fallbackMarker) throw err;
+			expectedAttempt = compactAttemptNumber(fallbackMarker) ?? expectedAttempt;
+			expectedSeq = fallbackMarker.seq ?? expectedSeq;
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
+				narratorId,
+				message: fallbackMarker,
+				...replacementFields,
+			});
+			usedModel = fallback.model;
+			usedLayer = "fallback";
+			compactProgress.setModel(
+				fallback.model,
+				resolveDefaultReasoningEffort(undefined, fallback.model),
+			);
+			try {
+				({ summary, contextPercent } = await runSummary(fallback.model));
+			} catch (fallbackErr) {
+				// 取消/超时语义原样透传，否则会被当成"两层都失败"的普通错误，
+				// 破坏取消时的静默回滚。
+				if (isCompactAbortError(fallbackErr)) throw fallbackErr;
+				// 两次错误一起带上：只报最后一层会让人误以为是回落模型的问题。
+				logger.error("Compact failed with both the primary and the fallback model", {
+					narratorId,
+					primaryModel: selectedModel,
+					fallbackModel: fallback.model,
+					primaryError: String(err),
+					fallbackError: String(fallbackErr),
+				});
+				throw new Error(
+					`Compact failed with both models — ${selectedModel} (${compactErrorText(err)}), then ${fallback.model} (${compactErrorText(fallbackErr)})`,
+					{ cause: fallbackErr },
+				);
+			}
+		}
 		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
 		// persistence boundary as well so a late summary can never win the CAS.
@@ -1129,7 +1226,11 @@ async function doRunCustomCompact({
 		}
 		logger.info("Custom compact completed", {
 			narratorId,
-			model: selectedModel,
+			// 归属必须可观测：只报"用了哪个模型"还不够，得能看出是会话模型做的
+			// 还是回落到 summaryModel 做的，否则没人知道回落到底有没有在生效。
+			model: usedModel,
+			modelLayer: usedLayer,
+			primaryModel: selectedModel,
 			summaryLength: summary.length,
 		});
 		await broadcastCompactDone(narratorId, {
@@ -1422,12 +1523,17 @@ async function doRunSegmentCompact({
 		hiddenMessageIds,
 	});
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
+	// 与历史压缩同一套模型顺序（会话自己的模型优先，summaryModel 回落）：
+	// 分段压缩也是用户主动发起的压缩，两条路径各用一套顺序只会变成"同一个按钮
+	// 在不同入口行为不同"的隐藏差异。
+	const layers = await resolveCompactModelLayers(narratorId);
+	const selectedModel = layers.primary.model;
 	const compactProgress = createCompactProgressReporter({
 		narratorId,
 		messageId: markerMsg.id,
 		mode: "blocking",
-		model: settings.agent.summaryModel,
-		reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
+		model: selectedModel,
+		reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
 		startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
 		isSegment: true,
 		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
@@ -1452,21 +1558,66 @@ async function doRunSegmentCompact({
 		// Same retry-visibility contract as the history path: every scheduled retry
 		// bumps one ordinal the UI can show instead of a silent 0-char spinner.
 		let segmentRetryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
-			narratorId,
-			locale,
-			messages,
-			signal,
-			undefined,
-			compactProgress.onTextDelta,
-			compactProgress.onReasoningDelta,
-			hooks?.beat,
-			(info) => {
-				segmentRetryCount += 1;
-				compactProgress.reportRetry(segmentRetryCount, info.error);
-			},
-			userId,
-		);
+		const onSegmentRetryScheduled = (info: SummaryRetryInfo) => {
+			segmentRetryCount += 1;
+			compactProgress.reportRetry(segmentRetryCount, info.error);
+		};
+		// 与历史压缩一致：同一份输入、同一个提示词，只换模型，最多两层。
+		// 分段标记（`segment_compact`）没有 `attempts` 结构可写，因此这里的归属
+		// 只体现在 live 进度与日志里（历史压缩另外还会写进压缩记录）。
+		const runSegmentSummary = (model: string) =>
+			narratorContext.generateCompactSummary(
+				narratorId,
+				locale,
+				messages,
+				signal,
+				model,
+				compactProgress.onTextDelta,
+				compactProgress.onReasoningDelta,
+				hooks?.beat,
+				onSegmentRetryScheduled,
+				userId,
+			);
+
+		let segmentUsedModel = selectedModel;
+		let segmentUsedLayer: "primary" | "fallback" = "primary";
+		let summary: string;
+		let contextPercent: number | undefined;
+		try {
+			({ summary, contextPercent } = await runSegmentSummary(selectedModel));
+		} catch (err) {
+			if (!layers.fallback || signal?.aborted || isCompactAbortError(err)) throw err;
+			const fallback = layers.fallback;
+			logger.warn("Segment compact failed with the primary model; retrying once", {
+				narratorId,
+				primaryModel: selectedModel,
+				primarySource: layers.primary.source,
+				fallbackModel: fallback.model,
+				error: String(err),
+			});
+			segmentUsedModel = fallback.model;
+			segmentUsedLayer = "fallback";
+			compactProgress.setModel(
+				fallback.model,
+				resolveDefaultReasoningEffort(undefined, fallback.model),
+			);
+			try {
+				({ summary, contextPercent } = await runSegmentSummary(fallback.model));
+			} catch (fallbackErr) {
+				if (isCompactAbortError(fallbackErr)) throw fallbackErr;
+				logger.error("Segment compact failed with both the primary and the fallback model", {
+					narratorId,
+					primaryModel: selectedModel,
+					fallbackModel: fallback.model,
+					primaryError: String(err),
+					fallbackError: String(fallbackErr),
+				});
+				throw new Error(
+					`Compact failed with both models — ${selectedModel} (${compactErrorText(err)}), then ${fallback.model} (${compactErrorText(fallbackErr)})`,
+					{ cause: fallbackErr },
+				);
+			}
+		}
 		compactProgress.finish();
 		// Enforce cancellation at the persistence boundary too, so a summary that
 		// arrives after the watchdog fired cannot finalize a marker whose lock is gone.
@@ -1493,6 +1644,9 @@ async function doRunSegmentCompact({
 		logger.info("Segment compact completed", {
 			narratorId,
 			messageCount: messageIds.length,
+			model: segmentUsedModel,
+			modelLayer: segmentUsedLayer,
+			primaryModel: selectedModel,
 			summaryLength: summary.length,
 		});
 		await setCompactingSubstatus(narratorId, "blocking", false).catch((err) => {

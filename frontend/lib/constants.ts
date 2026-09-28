@@ -64,6 +64,13 @@ export type ModelOption = {
 	 * Empty/absent means it is not currently pinned as default or summary.
 	 */
 	pinnedAs?: Array<"default" | "summary">;
+	/**
+	 * 编排方案的载荷（`provider === ORCHESTRATION_PROVIDER_KEY` 时才有）。
+	 *
+	 * 模型菜单按 `provider` 分组后只拿到 ModelOption，没有别的通道能把方案的
+	 * 编制者模型与四档池摘要送到菜单行上，因此载荷挂在选项本身。
+	 */
+	orchestration?: OrchestrationMenuProfile;
 };
 
 /** Sentinel value stored in DB to mean "follow the default model from settings". */
@@ -121,6 +128,72 @@ export function parseAggModelValue(raw?: string | null): {
 export function buildAggModelValue(aggId: string, pinnedModel?: string): string {
 	if (pinnedModel) return `${AGG_MODEL_PREFIX}${aggId}:${pinnedModel}`;
 	return `${AGG_MODEL_PREFIX}${aggId}`;
+}
+
+/**
+ * 编排模式哨兵前缀。
+ *
+ * 会话处于编排模式时 `narrators.model` 存的是 `__orch__:<profileId>` 而不是任何
+ * 具体模型。必须与服务端 `server/lib/settings/provider.ts` 的
+ * ORCHESTRATION_MODEL_PREFIX 逐字一致——两边一旦漂移，前端显示的是编排方案、
+ * 后端读到的却是一个解析不出模型的普通模型名。
+ */
+export const ORCHESTRATION_MODEL_PREFIX = "__orch__:";
+
+/**
+ * 编排分组在 `ModelOption.provider` 里的哨兵 key，与 `__default__` / `__agg__`
+ * 同源：菜单按 provider 分组，这个值就是「编排模式」这一组的身份。
+ */
+export const ORCHESTRATION_PROVIDER_KEY = "__orchestration__";
+
+/** profileId 的合法字符集，与服务端 parseOrchestrationModelValue 一致。 */
+const ORCHESTRATION_PROFILE_ID_PATTERN = /^[a-z0-9]+$/;
+
+/**
+ * 解析编排哨兵，非编排值一律返回 null。
+ *
+ * 与服务端同样是严格匹配：`model` 里可能出现任意历史值，把近似值当成编排会让
+ * 一个手填的模型名意外把界面切成编排模式。
+ */
+export function parseOrchestrationModelValue(raw?: string | null): { profileId: string } | null {
+	if (typeof raw !== "string") return null;
+	const trimmed = raw.trim();
+	if (!trimmed.startsWith(ORCHESTRATION_MODEL_PREFIX)) return null;
+	const profileId = trimmed.slice(ORCHESTRATION_MODEL_PREFIX.length);
+	if (!ORCHESTRATION_PROFILE_ID_PATTERN.test(profileId)) return null;
+	return { profileId };
+}
+
+/** 把方案 id 编码成模型引用（写入 narrators.model 的值）。 */
+export function buildOrchestrationModelValue(profileId: string): string {
+	return `${ORCHESTRATION_MODEL_PREFIX}${profileId}`;
+}
+
+/** 当前模型引用是否表示「处于编排模式」。 */
+export function isOrchestrationModelValue(raw?: string | null): boolean {
+	return parseOrchestrationModelValue(raw) !== null;
+}
+
+/** 编排的四个档位，顺序即界面顺序（由轻到重）。 */
+export type OrchestrationTierName = "chore" | "quick" | "medium" | "heavy";
+
+/** 四档的固定顺序，供遍历共用。 */
+export const ORCHESTRATION_TIER_NAMES: readonly OrchestrationTierName[] = [
+	"chore",
+	"quick",
+	"medium",
+	"heavy",
+];
+
+/** 编排方案在模型菜单里需要的字段（前端本地形状，不 import 服务端模块）。 */
+export interface OrchestrationMenuProfile {
+	id: string;
+	name: string;
+	description?: string;
+	/** 编制者候选模型（有序，取第一个可用者）。 */
+	orchestratorModels: string[];
+	/** 每档模型池的模型引用（"provider:modelId"）；空数组表示该档为空。 */
+	tierPools: Record<OrchestrationTierName, string[]>;
 }
 
 /**

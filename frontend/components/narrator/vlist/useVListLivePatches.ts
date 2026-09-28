@@ -54,6 +54,7 @@ import {
 	LivePatchQueue,
 	patchSubagentActivitySnapshots,
 	patchSubagentIdentity,
+	patchSubagentModelWaitByNarrator,
 	patchSubagentTakeoverByNarrator,
 } from "./vlist-live-patch";
 
@@ -424,6 +425,27 @@ export function useVListLivePatches(
 				enqueue((messages) =>
 					patchSubagentTakeoverByNarrator(messages, subagentNarratorId, takenOver),
 				);
+			},
+
+			// 子代理停在「模型不可用」等待上 / 该等待已解除（阶段 6）。
+			//
+			// 纯运行期事实，因此只走这一条通道：帧到达时在卡片上落 `_modelWait`，
+			// 卡片的模型 badge 随即变成"换模型继续"的入口。恢复帧必须把标记清掉，
+			// 否则一个已经正常跑起来的 worker 会被一直说成"还在等模型"，
+			// 而那个可点的 badge 会让用户白换一次模型。
+			onSubagentModelUnavailableWaiting: (subagentNarratorId, info) => {
+				if (!subagentNarratorId) return;
+				enqueue((messages) =>
+					patchSubagentModelWaitByNarrator(messages, subagentNarratorId, {
+						model: info.model,
+						...(info.waitKind ? { waitKind: info.waitKind } : {}),
+						...(info.resumeAt != null ? { resumeAt: info.resumeAt } : {}),
+					}),
+				);
+			},
+			onSubagentModelUnavailableRecovered: (subagentNarratorId) => {
+				if (!subagentNarratorId) return;
+				enqueue((messages) => patchSubagentModelWaitByNarrator(messages, subagentNarratorId, null));
 			},
 
 			// Execution began (permission granted). The persisted half of the same signal

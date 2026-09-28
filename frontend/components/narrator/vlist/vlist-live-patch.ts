@@ -56,6 +56,7 @@ import {
 	type SendDeliveryTarget,
 } from "@shared/communication-tool";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { SubagentModelWait } from "@shared/orchestration-worker-type";
 import {
 	ACTIVE_REFLECTION_STATUSES,
 	getPermissionReflectionSuggestion,
@@ -673,6 +674,93 @@ function markTakenOverForNarrator(
 		}
 		if (next.children?.length) {
 			const child = markTakenOverForNarrator(next.children, subagentNarratorId, takenOver);
+			if (child.changed) {
+				changed = true;
+				next = { ...next, children: child.messages as TreeMessage[] };
+			}
+		}
+		return next;
+	});
+	return { messages: changed ? updated : messages, changed };
+}
+
+/**
+ * 子代理正在等待模型恢复（凭据池或配额）时，在它的卡片上落下 `_modelWait`。
+ *
+ * 存在的理由与 `_takenOver` 完全一样：这是**只在运行期存在**的事实——服务端的
+ * 消息快照里没有它（等待态一结束它就消失），而卡片上的模型 badge 要据此变成可点。
+ * 没有这条补丁，父会话里那张卡片只会显示成一个普通的运行中子代理，
+ * 用户看到"卡住了"却没有任何可操作的入口。
+ *
+ * 写 `_modelWait`（null 清除）而不是塞进 `_subagentActivity`：活动摘要会被消息重载
+ * 与服务端快照反复覆盖/合并，而等待态是纯运行期状态，不该被任何一次重载留下残影
+ * ——正是这一点让 `_takenOver` 需要两处同步，这里刻意只留一处事实。
+ */
+export function patchSubagentModelWaitByNarrator(
+	messages: readonly TreeMessage[],
+	subagentNarratorId: string,
+	wait: SubagentModelWait | null,
+): LivePatchResult {
+	if (!subagentNarratorId || !Array.isArray(messages) || messages.length === 0)
+		return unchanged(messages);
+	const result = markModelWaitForNarrator(messages as TreeMessage[], subagentNarratorId, wait);
+	return result.changed ? result : unchanged(messages);
+}
+
+function withModelWaitEntry(
+	entry: Record<string, unknown>,
+	wait: SubagentModelWait | null,
+): Record<string, unknown> {
+	if (!wait) {
+		if (!("_modelWait" in entry)) return entry;
+		const { _modelWait: _cleared, ...rest } = entry;
+		return rest;
+	}
+	const current = entry._modelWait as SubagentModelWait | null | undefined;
+	// 同一个等待重复到达（轮询/重连）时返回原引用，避免无谓的文档重建。
+	if (
+		current &&
+		current.waitKind === wait.waitKind &&
+		current.resumeAt === wait.resumeAt &&
+		current.model === wait.model
+	) {
+		return entry;
+	}
+	return { ...entry, _modelWait: wait };
+}
+
+function markModelWaitForNarrator(
+	messages: TreeMessage[],
+	subagentNarratorId: string,
+	wait: SubagentModelWait | null,
+): { messages: readonly TreeMessage[]; changed: boolean } {
+	let changed = false;
+	const updated = messages.map((message) => {
+		let next = message;
+		let localChanged = false;
+		const nextContent = (message.contentJson ?? []).map((block) => {
+			if (block.type !== "tool_use") return block;
+			const record = block as unknown as Record<string, unknown>;
+			if (!ownsSubagent(record, subagentNarratorId)) return block;
+			const patched = withModelWaitEntry(record, wait);
+			if (patched === record) return block;
+			localChanged = true;
+			return patched as unknown as typeof block;
+		});
+		const nextCalls = (message.toolCalls ?? []).map((call) => {
+			const record = call as unknown as Record<string, unknown>;
+			if (!ownsSubagent(record, subagentNarratorId)) return call;
+			const patched = withModelWaitEntry(record, wait);
+			if (patched === record) return call;
+			localChanged = true;
+			return patched as unknown as typeof call;
+		});
+		if (localChanged) {
+			changed = true;
+			next = { ...message, contentJson: nextContent, toolCalls: nextCalls };
+		}
+		if (next.children?.length) {
+			const child = markModelWaitForNarrator(next.children, subagentNarratorId, wait);
 			if (child.changed) {
 				changed = true;
 				next = { ...next, children: child.messages as TreeMessage[] };

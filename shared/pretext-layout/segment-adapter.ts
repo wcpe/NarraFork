@@ -28,6 +28,12 @@ import {
 	injectionBlockViews,
 	isNativeModelContextBlock,
 } from "../native-injection";
+import {
+	ORCHESTRATION_WORKER_TIERS,
+	type OrchestrationWorkerTier,
+	parseOrchestrationWorkerType,
+	type SubagentModelWait,
+} from "../orchestration-worker-type";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
@@ -345,6 +351,11 @@ export interface AdapterToolItem {
 		 * the card's already-fixed header row.
 		 */
 		_takenOver?: boolean;
+		/**
+		 * 子代理正停在「模型不可用」的等待上（运行期事实，只由 WS 帧写入）。
+		 * 模型 badge 据此变为可点（换模型继续）。
+		 */
+		_modelWait?: SubagentModelWait;
 		[key: string]: unknown;
 	};
 }
@@ -389,6 +400,28 @@ export function resolveToolDetailRef(item: AdapterToolItem): AdapterToolDetailRe
 function resolveTakenOver(item: AdapterToolItem): boolean {
 	if (isTerminalStatus(item.tc.status)) return false;
 	return item.tc._takenOver === true || item.tc._subagentActivity?.takenOver === true;
+}
+
+/**
+ * 该子代理是否正停在「模型不可用」的等待上（凭据池不可用 / 配额窗口未重置）。
+ *
+ * 只有 `tc._modelWait` 一个来源，与该状态的性质一致：它是纯运行期事实，
+ * 由 WS 帧驱动（见 `patchSubagentModelWaitByNarrator`），服务端的消息快照里没有它。
+ * 因此**不**做 `_subagentActivity` 的回退——那只会让一次消息重载读出一个早已结束的
+ * 等待，让模型 badge 在一个正在正常运行的下级身上变成可点。
+ *
+ * 与 `resolveTakenOver` 同样按非终态过滤：等待态只可能发生在运行中的调用上，
+ * 一个已经结束的调用不可能"正在等模型恢复"。
+ */
+export function resolveSubagentModelWait(item: AdapterToolItem): SubagentModelWait | null {
+	if (isTerminalStatus(item.tc.status)) return null;
+	const wait = item.tc._modelWait as SubagentModelWait | undefined;
+	if (!wait || typeof wait.model !== "string" || wait.model.length === 0) return null;
+	return {
+		model: wait.model,
+		...(wait.waitKind ? { waitKind: wait.waitKind } : {}),
+		...(typeof wait.resumeAt === "number" ? { resumeAt: wait.resumeAt } : {}),
+	};
 }
 
 /**
@@ -496,6 +529,21 @@ function readNonEmptyString(record: Record<string, unknown>, key: string): strin
 function nonEmptyTrimmed(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	return value.trim() || undefined;
+}
+
+/**
+ * Agent 工具输入里的 `tier`，只认四个合法档位。
+ *
+ * 严格取值而不是原样透传：卡片据此画档位 badge，一个来自脏数据或手改请求的
+ * `"Quick"` / `"turbo"` 会被渲染成看起来同样权威的标识。返回 undefined 表示
+ * "这张卡片没有档位可标"，比标错强。
+ */
+function readOrchestrationTierValue(value: unknown): OrchestrationWorkerTier | undefined {
+	const tier = nonEmptyTrimmed(value);
+	if (!tier) return undefined;
+	return (ORCHESTRATION_WORKER_TIERS as readonly string[]).includes(tier)
+		? (tier as OrchestrationWorkerTier)
+		: undefined;
 }
 
 export type AdapterSegment =
@@ -922,6 +970,19 @@ export interface AdapterContext {
 	 * optional button row, so the answer changes the measured height.
 	 */
 	canOfferModelTest?: (errorText: string) => boolean;
+	/**
+	 * Whether this error card may offer "switch model and continue".
+	 *
+	 * Same measured-row contract as the two above: the control is a labelled button on
+	 * the card's one optional button row, so the answer has to be known during
+	 * adaptation, not at paint time.
+	 *
+	 * Eligibility here is a property of the NARRATOR, not of the error text: the card
+	 * belongs to one session, and only an orchestration worker (an `orch--…` /
+	 * `orch-review--…` child) can be handed on to another model. The shell answers it
+	 * because the narrator's `subagentType` is not in the layout spec.
+	 */
+	canOfferOrchestrationModelSwitch?: (errorText: string) => boolean;
 	/** Pure resolvers injected by the shell; deterministic fallbacks keep tests simple. */
 	resolveReasoningSegments?: (text: string) => ReasoningSegment[];
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
@@ -3394,6 +3455,7 @@ function adaptSystemTextData(
 			// eligible.
 			const offerFix = ctx.canOfferProviderFix?.(errorText) === true;
 			const offerModelTest = ctx.canOfferModelTest?.(errorText) === true;
+			const offerModelSwitch = ctx.canOfferOrchestrationModelSwitch?.(errorText) === true;
 			const buttons: string[] = [];
 			const buttonIds: string[] = [];
 			if (offerFix) {
@@ -3403,6 +3465,10 @@ function adaptSystemTextData(
 			if (offerModelTest) {
 				buttons.push(sysLabel(ctx, "testCurrentModel"));
 				buttonIds.push("testCurrentModel");
+			}
+			if (offerModelSwitch) {
+				buttons.push(sysLabel(ctx, "switchWorkerModel"));
+				buttonIds.push("switchOrchestrationModel");
 			}
 			return {
 				kind: "error",
@@ -3935,6 +4001,18 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
 	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
+	// 编排 worker 的角色：类型编码是唯一权威来源（见 orchestration-worker-type.ts）。
+	// 非编排子代理解析为 null，卡片据此保持完全只读。
+	const orchestrationScope = parseOrchestrationWorkerType(agentType);
+	// 编排 worker 的档位。两个来源，顺序是刻意的：
+	//  - 类型编码（`orch--<profileId>--<tier>` / `orch-review--…`）：显式类型与复核者的
+	//    权威来源，也是换模型入口唯一认得出来的形状；
+	//  - 工具输入的 `tier`：编排模式下它在 schema 里**必填**，而执行者的
+	//    `subagent_type` 被明确要求留空（类型由 tier 派生，见 task.ts 的 schema 描述）。
+	//    只认类型编码会让绝大多数执行者卡片没有档位——而"本轮用了哪个档位"正是这个
+	//    标识要回答的问题。
+	const orchestrationTier = orchestrationScope?.tier ?? readOrchestrationTierValue(input.tier);
+	const modelWait = resolveSubagentModelWait(item);
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary
 	// already carries the child narrator's EFFECTIVE tier, so it wins over the
@@ -3962,6 +4040,21 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? { modelInheritance: activity.modelInheritance }
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+		// 编排 worker 的「换模型继续」入口（阶段 6）与档位 badge（阶段 7）。
+		//
+		// `agentType` 就是子代理类型编码（`orch--<profileId>--<tier>` /
+		// `orch-review--<profileId>--<tier>`），因此资格判定在这里是纯解析——不看
+		// narratorId、不猜形状。三个字段都是高度中性的：`subagentNarratorId` 与
+		// `workerTier` 只进 extra（行内没有它们的位置），`modelWait` 决定模型 badge
+		// 是否可点并且换一条 badge 文案（固定 badge 行，行高不变）。
+		//
+		// 档位 badge 用 `orchestrationTier` 而不是 `orchestrationScope.tier`：执行者
+		// 那边 `subagent_type` 是空的（见上文的来源说明），只有 `tier` 读得到档位。
+		// `workerKind` 仍然只认类型编码——判错"这是复核者"比没有这个标识更糟。
+		...(activity?.subagentNarratorId ? { subagentNarratorId: activity.subagentNarratorId } : {}),
+		...(orchestrationTier ? { workerTier: orchestrationTier } : {}),
+		...(orchestrationScope ? { workerKind: orchestrationScope.kind } : {}),
+		...(modelWait ? { modelWait } : {}),
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is

@@ -4,6 +4,10 @@ import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import type {
+	OrchestrationStatusResponse,
+	OrchestrationUsageResponse,
+} from "@shared/orchestration-status";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
@@ -1240,6 +1244,66 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ model }),
 		}),
+	/**
+	 * 进入/退出编排模式。
+	 *
+	 * 编排状态由 `model` 的哨兵（`__orch__:<profileId>`）承载，但写入必须走这条
+	 * 入口：服务端会校验方案存在且启用、配了编制者模型、会话是主叙述者，
+	 * 并拒绝把哨兵交给普通 model PATCH。`profileId: null` 表示退出，服务端会把
+	 * model 落回会话默认模型语义（而不是把哨兵留在库里）。
+	 */
+	updateNarratorOrchestration: (id: string, profileId: string | null) =>
+		request<{ ok: boolean; model: string }>(`/narrators/${id}/orchestration`, {
+			method: "PATCH",
+			body: JSON.stringify({ profileId }),
+		}),
+	/**
+	 * 换模型继续：让撞上配额 / 余额 / 模型不可用的编排 worker 带着已有上下文接着干。
+	 *
+	 * `id` 是**编排会话**（编制者），不是 worker：目标模型必须落在该 worker 档位的
+	 * 模型池里，而池属于方案、方案挂在编制者身上。服务端会依次做：校验 worker 归属与
+	 * 类型 → 校验池内 → 落库新模型 → 续跑。
+	 *
+	 * `outOfPool` 为 true 表示池内一个可用模型都没有，服务端刻意放开了池外；此时
+	 * 必须显式告诉用户本次不在池内（容量统计不含它），不能静默成功。
+	 */
+	recoverOrchestrationWorker: (
+		id: string,
+		payload: { workerNarratorId: string; model: string; action?: "continue" | "retry" },
+	) =>
+		request<{
+			ok: true;
+			workerNarratorId: string;
+			model: string;
+			tier: string;
+			kind: "executor" | "reviewer";
+			continuation: "restarted" | "in_place";
+			outOfPool: boolean;
+			/** 该档位的池内容（供界面解释"原本的候选是什么"）。 */
+			tierPool: string[];
+		}>(`/narrators/${id}/orchestration/recover`, {
+			method: "POST",
+			body: JSON.stringify(payload),
+		}),
+	/**
+	 * 编排状态（只读观测）。
+	 *
+	 * 一次给出三组数据：会话的编排身份（方案 / 编制者模型）、每档的停放数与在场数、
+	 * 每档池条目的「在飞数 / 并发上限」。服务端全程只读，因此可以按需重复拉取。
+	 *
+	 * 非编排会话返回 `{ orchestration: null }` 而不是错误：调用方据此收起详情，
+	 * 不需要把正常状态当异常处理。
+	 */
+	getOrchestrationStatus: (id: string) =>
+		request<OrchestrationStatusResponse>(`/narrators/${id}/orchestration/status`),
+	/**
+	 * 编排会话的 token 开销（只读）。
+	 *
+	 * 与上面的状态分成两个请求：状态要秒级轮询、每轮都必须便宜，而开销是随会话增长的
+	 * 分组聚合，只有打开详情面板时才需要看。合成一个接口会让每次轮询都白跑一次聚合。
+	 */
+	getOrchestrationUsage: (id: string) =>
+		request<OrchestrationUsageResponse>(`/narrators/${id}/orchestration/usage`),
 	// --- Broken model migration (admin only) ---
 	scanBrokenModelNarrators: (opts?: { includeArchived?: boolean }) =>
 		request<BrokenModelScanResponse>(

@@ -7,6 +7,7 @@ import {
 	FOLLOW_SUMMARY_MODEL,
 	type ModelAggregation,
 	parseAggModelValue,
+	parseOrchestrationModelValue,
 } from "../../../lib/constants";
 
 /**
@@ -38,12 +39,16 @@ export function modelProviderPrefix(value: string | null | undefined): string | 
  * definition the resolver cannot break. "Follow parent" is subagent-only and
  * has no meaning in an instance-wide slot.
  *
+ * 编排哨兵同样被拒绝：`__orch__:<profileId>` 不是一个模型，写进全局槽位后
+ * 全局默认/摘要模型都解析不出东西，而错误会在会话装配时才以另一个名字炸出来。
+ *
  * Concretely selectable models and aggregation roots are allowed; indented
  * aggregation members are not menu entries with their own roles — selecting one
  * pins that member on the narrator session instead.
  */
 export function canAssignGlobalModelRole(value: string | null | undefined): boolean {
 	if (!value) return false;
+	if (parseOrchestrationModelValue(value)) return false;
 	return (
 		value !== FOLLOW_DEFAULT_MODEL &&
 		value !== FOLLOW_SUMMARY_MODEL &&
@@ -54,8 +59,38 @@ export function canAssignGlobalModelRole(value: string | null | undefined): bool
 export function modelMenuSelection(
 	currentModel: string | null | undefined,
 	aggregations: ModelAggregation[],
-) {
+):
+	| {
+			value: string;
+			baseValue: string;
+			members: string[];
+			targetValue: string;
+			isOrchestration: true;
+			orchestrationProfileId: string;
+	  }
+	| {
+			value: string;
+			baseValue: string;
+			members: string[];
+			targetValue: string;
+			isOrchestration: false;
+			orchestrationProfileId: null;
+	  } {
 	const value = currentModel || FOLLOW_DEFAULT_MODEL;
+	// 编排哨兵在聚合解析之前显式分流：它既不是聚合成员也不是具体模型。
+	// 依赖「聚合解析碰巧返回 null」的兜底正是把陌生哨兵误判成普通模型的地方，
+	// 菜单会把编排值当成一个找不到的模型行，选中标记也就永远落不下去。
+	const orchestration = parseOrchestrationModelValue(value);
+	if (orchestration) {
+		return {
+			value,
+			baseValue: value,
+			members: [],
+			targetValue: value,
+			isOrchestration: true,
+			orchestrationProfileId: orchestration.profileId,
+		};
+	}
 	const parsed = parseAggModelValue(value);
 	const aggregation = parsed ? aggregations.find((item) => item.id === parsed.aggId) : undefined;
 	const members = aggregation?.models ?? [];
@@ -66,6 +101,8 @@ export function modelMenuSelection(
 		members,
 		// A removed pinned member still leaves its aggregation visible.
 		targetValue: parsed?.pinnedModel && !members.includes(parsed.pinnedModel) ? baseValue : value,
+		isOrchestration: false,
+		orchestrationProfileId: null,
 	};
 }
 

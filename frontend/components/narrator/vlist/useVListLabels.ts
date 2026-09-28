@@ -27,6 +27,7 @@
  */
 
 import { dangerCopyLabels } from "@shared/danger-copy";
+import type { OrchestrationWorkerTier } from "@shared/orchestration-worker-type";
 import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
@@ -193,6 +194,11 @@ export interface VListRenderLabels {
 		followTooltip: string;
 		/** `{parentModel}` / `{pool}` are substituted by the card. */
 		fallbackReason: string;
+		/** 编排 worker 的档位 badge 文案，四档齐全。 */
+		workerTier: Record<OrchestrationWorkerTier, string>;
+		/** 编排 worker 的身份 chip 文案：执行者 / 复核者。 */
+		workerExecutor: string;
+		workerReviewer: string;
 		/** File-changes section title. */
 		fileChanges: string;
 		/** Suffix for a file whose line counts are unknown. */
@@ -417,6 +423,9 @@ export function useVListLabels(): VListLabels {
 			// Also an adapter label, and for the same reason: it shares the fix's
 			// conditional button row, so the card's height depends on it existing.
 			testCurrentModel: t("testCurrentModel"),
+			// 编排 worker 的「换模型继续」。同一条约定：它和上面两个按钮共用那条
+			// 条件按钮行，因此存在与否会改变卡片高度，措辞必须走适配器。
+			switchWorkerModel: t("switchWorkerModel"),
 			specViewTasks: t("specGoalViewTasks"),
 			specClearTasks: t("specForkClearTasks"),
 			specResetTasks: t("specForkResetSpec"),
@@ -680,6 +689,17 @@ export function useVListLabels(): VListLabels {
 					parentModel: "{parentModel}",
 					pool: "{pool}",
 				}),
+				// 四档与服务端 `orchestrationTier_*` 同源，不再造一套档位名字。
+				workerTier: {
+					chore: t("orchestrationTier_chore"),
+					quick: t("orchestrationTier_quick"),
+					medium: t("orchestrationTier_medium"),
+					heavy: t("orchestrationTier_heavy"),
+				},
+				// 编排 worker 的身份 chip（类型 chip 的位置）：与档位同源，也来自
+				// `orchestrationRole_*`，避免再造一套角色名字。
+				workerExecutor: t("orchestrationRole_executor"),
+				workerReviewer: t("orchestrationRole_reviewer"),
 				fileChanges: t("subagentChangedFiles"),
 				linesNotMeasured: t("subagentLinesNotMeasured"),
 				moreFiles: t("subagentMoreFiles"),

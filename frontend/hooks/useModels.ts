@@ -1,8 +1,10 @@
+import { listOrchestratorModelRefs } from "@shared/orchestration-orchestrator-model";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
 import { api } from "../lib/api";
 import {
 	AGG_MODEL_PREFIX,
+	buildOrchestrationModelValue,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
 	groupModelsByProvider,
@@ -10,6 +12,10 @@ import {
 	type ModelOption,
 	mergeModels,
 	modelValue,
+	ORCHESTRATION_PROVIDER_KEY,
+	ORCHESTRATION_TIER_NAMES,
+	type OrchestrationMenuProfile,
+	type OrchestrationTierName,
 } from "../lib/constants";
 import type { ProviderCapabilityKey } from "./usePlatform";
 
@@ -172,6 +178,100 @@ export function getConfiguredFallbackModels(
 		}
 	}
 	return results;
+}
+
+/**
+ * 判断值是否为普通对象（排除 null 与数组）。
+ *
+ * 设置是从 API 拿回来的动态 JSON：编排方案里的任何字段都可能是字符串、数组或
+ * null，取值前必须先收窄，否则一次坏数据就会让整个模型菜单崩掉。
+ */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 把设置里的编排方案合成模型菜单选项。
+ *
+ * 方案不是模型，因此它们不参与任何「可用模型」集合，也不进入 `groupedModels`
+ * （设置页的全局默认/摘要选择器共用那份数据，把编排值写进全局槽位只会得到一个
+ * 解析不出模型的哨兵）。它们只作为菜单的一个独立分组出现。
+ *
+ * 不经过 `getConfiguredFallbackModels`：那个函数会主动丢弃 `FOLLOW_*` / `AGG_*`
+ * 前缀的值，而且它遍历的是「已配置的 provider 前缀」——编排值既不是 provider 也
+ * 不是模型，塞进去只会被它的两道过滤各自丢一次，最后静默地什么都不剩。
+ */
+export function getOrchestrationModelOptions(
+	settingsData: Record<string, unknown> | undefined,
+): ModelOption[] {
+	const orchestration = settingsData?.agent;
+	if (!isPlainRecord(orchestration)) return [];
+	const raw = orchestration.orchestration;
+	if (!isPlainRecord(raw)) return [];
+
+	// 清单条目既可能是纯字符串（历史写法）也可能是带思考强度的对象，因此必须走共享解析
+	// 而不是自己 `typeof model === "string"`：只认字符串会让带强度的配置在这里被整条
+	// 丢掉，表现为"进编排模式的菜单项不见了"（而设置页里明明配着）。
+	const orchestratorModels = listOrchestratorModelRefs(raw.orchestratorModels);
+	// 没有编制者模型 = 编排功能关闭。此时服务端 PATCH 一定会拒绝进入，给出一个
+	// 永远选不中的选项比不显示更糟：用户只会拿到一条看不懂的报错。
+	if (orchestratorModels.length === 0) return [];
+
+	const profiles = Array.isArray(raw.profiles) ? raw.profiles : [];
+	const options: ModelOption[] = [];
+	const seen = new Set<string>();
+	for (const candidate of profiles) {
+		if (!isPlainRecord(candidate)) continue;
+		// 未启用的方案不出现（服务端也不允许进入）。
+		if (candidate.enabled === false) continue;
+		const id = typeof candidate.id === "string" ? candidate.id.trim() : "";
+		if (!id || seen.has(id)) continue;
+		const tiers = candidate.tiers;
+		if (!isPlainRecord(tiers)) continue;
+		// 四档齐全才算方案：缺档的方案在服务端会被 listEnabledProfiles 丢掉，
+		// 放它进菜单等于给出一条注定失败的写入路径。
+		const pools: Array<Record<string, unknown>> = [];
+		let complete = true;
+		for (const tier of ORCHESTRATION_TIER_NAMES) {
+			const tierConfig = tiers[tier];
+			if (!isPlainRecord(tierConfig)) {
+				complete = false;
+				break;
+			}
+			pools.push(tierConfig);
+		}
+		if (!complete) continue;
+
+		const tierPools = {} as Record<OrchestrationTierName, string[]>;
+		for (const [index, tier] of ORCHESTRATION_TIER_NAMES.entries()) {
+			const pool = pools[index]?.pool;
+			tierPools[tier] = (Array.isArray(pool) ? pool : [])
+				.map((entry) =>
+					isPlainRecord(entry) && typeof entry.model === "string" ? entry.model.trim() : "",
+				)
+				.filter((model) => model.length > 0);
+		}
+		const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+		const description =
+			typeof candidate.description === "string" ? candidate.description.trim() : "";
+		const orchestrationProfile: OrchestrationMenuProfile = {
+			id,
+			// 名字缺失时退回 id：宁可显示一个不好看但可识别的标识，也不要一行空白。
+			name: name || id,
+			// 方案名与描述是用户数据，不做翻译；「编排」后缀由菜单侧走 i18n 渲染。
+			...(description ? { description } : {}),
+			orchestratorModels,
+			tierPools,
+		};
+		seen.add(id);
+		options.push({
+			value: buildOrchestrationModelValue(id),
+			label: orchestrationProfile.name,
+			provider: ORCHESTRATION_PROVIDER_KEY,
+			orchestration: orchestrationProfile,
+		});
+	}
+	return options;
 }
 
 /**
@@ -734,6 +834,17 @@ export function useAllModels() {
 			__agg__: "Aggregations",
 		});
 
+		// 编排方案追加在所有模型之后，且刻意晚于 groupedModels：那是一份被全局
+		// 默认/摘要模型选择器共用的数据，编排值绝不能出现在那里。只有会话的模型
+		// 菜单（menuModels）能看到它们，并由 ModelMenuItems 渲染成独立分组。
+		const orchestrationOptions = getOrchestrationModelOptions(
+			settingsData as Record<string, unknown> | undefined,
+		);
+		const menuModels =
+			orchestrationOptions.length > 0
+				? [...visibleWithDefault, ...orchestrationOptions]
+				: visibleWithDefault;
+
 		// Provider prefix → NUG provider id. Model pickers group by prefix, so this
 		// is what lets a group header address the right provider (e.g. to refresh
 		// just that gateway's model list) without touching every ModelOption.
@@ -751,6 +862,14 @@ export function useAllModels() {
 			visibleWithDefault,
 			/** Grouped for Mantine Select (includes "follow default" and aggregations). */
 			groupedModels,
+			/**
+			 * 会话模型菜单的完整数据源：`visibleWithDefault` 加上编排方案。
+			 * 只有会话模型菜单该用它——凡是要把选中值写进模型字段（全局默认/摘要、
+			 * 新建会话、子代理模型池）的地方都继续用 `groupedModels`。
+			 */
+			menuModels,
+			/** 编排方案选项（provider 为 ORCHESTRATION_PROVIDER_KEY）。 */
+			orchestrationOptions,
 			/** The "follow default" ModelOption. */
 			followDefaultOption,
 			/** The "follow summary" ModelOption. */

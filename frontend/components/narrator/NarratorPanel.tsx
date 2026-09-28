@@ -63,6 +63,7 @@ import {
 	useTakeoverSubagent,
 	useUpdateFastMode,
 	useUpdateModel,
+	useUpdateOrchestration,
 	useUpdatePermissionMode,
 	useUpdateReasoningEffort,
 	useUpdateReflectionOverrides,
@@ -91,7 +92,7 @@ import {
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertScope } from "../../lib/api/narrators";
-import { statusRegistry } from "../../lib/constants";
+import { isOrchestrationModelValue, statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
 	calculateEffectiveTurnElapsedMs,
@@ -177,6 +178,7 @@ import {
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import { useOrchestrationWorkerModelSwitch } from "./model/OrchestrationWorkerModelSwitch";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
@@ -354,8 +356,11 @@ function NarratorPanelBody({
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const reflectionOverridesMutation = useUpdateReflectionOverrides();
 	const modelMutation = useUpdateModel();
+	const orchestrationMutation = useUpdateOrchestration();
 	const {
-		visibleWithDefault: allModels,
+		// 会话模型菜单的完整数据源：模型 + 编排方案。编排方案不是模型，因此
+		// 只在这里出现，不进入 groupedModels（全局默认/摘要选择器共用那份数据）。
+		menuModels: allModels,
 		groupedModels,
 		defaultModelValue,
 		summaryModelValue,
@@ -1987,12 +1992,30 @@ function NarratorPanelBody({
 		[queuedMessages],
 	);
 
+	// 编排 worker 的「换模型继续」（阶段 6）。模态框挂在面板这一层，行只报"要救谁"。
+	// 用 `open` 而不是整个 handle 进依赖：handle 的 `modal` 每次渲染都是新节点，
+	// 折进去会让整个行处理束每次都重建。
+	const workerModelSwitch = useOrchestrationWorkerModelSwitch();
+	const openWorkerModelSwitch = useCallback(
+		(workerNarratorId: string, workerType: string) => {
+			workerModelSwitch.open({
+				primaryNarratorId: narratorId,
+				workerNarratorId,
+				subagentType: workerType,
+			});
+		},
+		[narratorId, workerModelSwitch.open],
+	);
+
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
 	// Mirrors the props passed to ChunkedMessageList (same names/signatures).
 	const vlistRowHandlers = useMemo(
 		() => ({
+			// 编排 worker 撞上模型不可用 / 配额时，子代理卡片的模型 badge 变成换模型入口。
+			// 卡片出现在**它的父级**的消息流里，因此这里的 narratorId 就是那个编排会话。
+			onSwitchWorkerModel: openWorkerModelSwitch,
 			onForkFromMessage: forkHandler,
 			onAskInPassing: handleAskInPassing,
 			onCompactBeforeMessage: compactSupported ? handleCompactBefore : undefined,
@@ -2045,6 +2068,7 @@ function NarratorPanelBody({
 			handleOpenKnowledgeEntry,
 			handleOpenSpecFile,
 			handleOpenChapter,
+			openWorkerModelSwitch,
 		],
 	);
 
@@ -2551,6 +2575,9 @@ function NarratorPanelBody({
 		onOpenTerminalPanel,
 		browserSessionsSupported: browserSessionsCapability.supported,
 		executionDevicesQuery,
+		// 与状态栏里那个编排状态按钮同一条判定（`model` 上的哨兵）：两处各写一套启发式
+		// 迟早会分叉成"状态栏说在编排、工具栏却给不出面板"。
+		orchestrationAvailable: isOrchestrationModelValue(narrator?.model),
 		mobileTasksOpen,
 		mobileToolPanel,
 		detailsOpened,
@@ -3344,6 +3371,11 @@ function NarratorPanelBody({
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
 								mutation: modelMutation,
+								orchestration: {
+									mutation: orchestrationMutation,
+									// 子代理不能再派子代理，模型菜单据此隐藏编排分组。
+									isSubagent,
+								},
 								onEditDefaultModel: () => setGlobalModelEditTarget("default"),
 								onEditSummaryModel: () => setGlobalModelEditTarget("summary"),
 								onSetAsDefaultModel: handleSetDefaultModel,
@@ -3633,6 +3665,9 @@ function NarratorPanelBody({
 					globalModelEditTarget === "summary" ? handleSetSummaryModel : handleSetDefaultModel
 				}
 			/>
+			{/* 编排 worker 的「换模型继续」：入口是子代理卡片上的模型 badge，因此模态框
+			    挂在拥有那张卡片的面板这一层（行是零 DOM 副本，自己不能拥有模态框）。 */}
+			{workerModelSwitch.modal}
 		</PermEnterHintCtx.Provider>
 	);
 }

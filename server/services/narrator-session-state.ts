@@ -159,6 +159,13 @@ export interface ActiveNarrator {
 	_enabledOptionalTools: Set<string>;
 	/** Tools disabled by narrator custom traits. */
 	_disabledTools: Set<string>;
+	/**
+	 * 当前会话所处的编排方案 ID（来自 `model` 的 `__orch__:<profileId>` 哨兵）。
+	 *
+	 * 由会话装配从 narrator 行的 model 推导，并在 PATCH /:id/orchestration 成功时
+	 * 就地更新——闸门读的是这个缓存而不是每轮重查数据库。
+	 */
+	_orchestrationProfileId?: string;
 	/** Skills blocked by narrator custom traits (`all` hides the Skill tool). */
 	_blockedSkills: { all: boolean; names: Set<string> };
 	/** Soft-stop flag: set when user approves a permission with feedbackText.

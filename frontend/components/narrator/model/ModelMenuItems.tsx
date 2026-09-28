@@ -17,6 +17,7 @@ import {
 	FOLLOW_PARENT_MODEL,
 	type ModelAggregation,
 	type ModelOption,
+	ORCHESTRATION_PROVIDER_KEY,
 	parseAggModelValue,
 } from "../../../lib/constants";
 import { modelInheritanceLabel } from "./model-inheritance-label";
@@ -27,6 +28,7 @@ import {
 	modelProviderPrefix,
 	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
+import { OrchestrationMenuItems } from "./OrchestrationMenuItems";
 
 /**
  * The provider-grouped model list rendered inside a narrator's model menu.
@@ -64,6 +66,9 @@ export function ModelMenuItems({
 	onPickerOpened,
 	canFollowParent = false,
 	inheritance,
+	hideOrchestration = false,
+	onExitOrchestration,
+	orchestrationPending = false,
 }: {
 	allModels: ModelOption[];
 	aggregations?: ModelAggregation[];
@@ -122,6 +127,15 @@ export function ModelMenuItems({
 	 * provider prefix line + model label, plus a warning line on pool fallback.
 	 */
 	inheritance?: SubagentModelInheritance | null;
+	/**
+	 * 子代理上下文置 true：编排方案会派生执行者，而子代理不能再派子代理，
+	 * 因此那里不显示编排分组（服务端也会拒绝子代理进入编排模式）。
+	 */
+	hideOrchestration?: boolean;
+	/** 退出编排模式（回到会话默认模型语义）。 */
+	onExitOrchestration?: () => void;
+	/** 编排进入/退出请求进行中。 */
+	orchestrationPending?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
@@ -172,6 +186,7 @@ export function ModelMenuItems({
 		__default__: t("modelGroupDefault"),
 		__summary__: t("modelGroupSummary"),
 		__agg__: t("modelGroupAggregations"),
+		[ORCHESTRATION_PROVIDER_KEY]: t("modelGroupOrchestration"),
 	};
 	const entries = [...groups.entries()];
 	const normalizedFilter = filter.trim().toLowerCase();
@@ -203,6 +218,10 @@ export function ModelMenuItems({
 				})
 				.filter(([, models]) => models.length > 0)
 		: entries;
+	// 子代理不能再派子代理，因此编排分组在那里整体不出现。
+	const visibleEntries = hideOrchestration
+		? filteredEntries.filter(([prov]) => prov !== ORCHESTRATION_PROVIDER_KEY)
+		: filteredEntries;
 	// For aggregation selection check: parse current model to see if it's an aggregation
 	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
 	// Follow-parent group: resolved exactly like the Default/Summary role rows —
@@ -259,12 +278,33 @@ export function ModelMenuItems({
 				</>
 			)}
 			{label && <Menu.Label>{label}</Menu.Label>}
-			{filteredEntries.length === 0 ? (
+			{visibleEntries.length === 0 ? (
 				<Text c="dimmed" p="xs" size="xs">
 					{t("noModelMatches")}
 				</Text>
 			) : (
-				filteredEntries.map(([prov, models], gi) => {
+				visibleEntries.map(([prov, models], gi) => {
+					// 编排方案不是模型，单独一组渲染：选中它写入的是
+					// `__orch__:<id>`（进入编排模式），不是模型值。
+					if (prov === ORCHESTRATION_PROVIDER_KEY) {
+						return (
+							<span key={prov}>
+								{gi > 0 && <Menu.Divider />}
+								<OrchestrationMenuItems
+									profiles={models}
+									currentProfileId={selection.orchestrationProfileId}
+									onSelect={onSelect}
+									onExit={onExitOrchestration}
+									exitPending={orchestrationPending}
+									opened={opened}
+									selectedItemRef={selectedItemRef}
+									resolveModelLabel={(value) =>
+										allModels.find((option) => option.value === value)?.label ?? value
+									}
+								/>
+							</span>
+						);
+					}
 					const isDefaultGroup = prov === "__default__";
 					const isSummaryGroup = prov === "__summary__";
 					const editHandler = isDefaultGroup

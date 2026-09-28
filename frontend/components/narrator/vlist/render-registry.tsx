@@ -207,6 +207,12 @@ export function resolveRenderExtra(spec: {
 			if ("isTakenOver" in data) extra.isTakenOver = data.isTakenOver;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
 			if ("resultText" in data) extra.resultText = data.resultText;
+			// 编排 worker 的「换模型继续」（阶段 6）：badge 是否可点、文案怎么变，
+			// 都由这几个高度中性的字段决定，必须显式送到渲染层。
+			if ("subagentNarratorId" in data) extra.subagentNarratorId = data.subagentNarratorId;
+			if ("workerTier" in data) extra.workerTier = data.workerTier;
+			if ("workerKind" in data) extra.workerKind = data.workerKind;
+			if ("modelWait" in data) extra.modelWait = data.modelWait;
 			// RenderSubagent reads the prompt body via `promptText` (not `prompt`).
 			if ("prompt" in data) extra.promptText = data.prompt;
 			if ("recentCallNames" in data) extra.recentCallNames = data.recentCallNames;
@@ -545,6 +551,10 @@ export function renderElement(
 					isTakenOver={extra.isTakenOver as boolean | undefined}
 					model={extra.model as string | undefined}
 					modelInheritance={extra.modelInheritance as SubagentModelInheritance | undefined}
+					workerTier={extra.workerTier as string | undefined}
+					// 角色必须真的送到组件：它此前只进了 `extra`（并被 `subagentRevision`
+					// 用作缓存键），渲染层拿不到——于是编排卡片只能画出工具名。
+					workerKind={extra.workerKind as "executor" | "reviewer" | undefined}
 					reasoningEffort={extra.reasoningEffort as string | undefined}
 					resultPreview={extra.resultPreview as string | undefined}
 					recentCallNames={extra.recentCallNames as string[] | undefined}

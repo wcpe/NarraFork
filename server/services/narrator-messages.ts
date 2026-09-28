@@ -2495,6 +2495,20 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 	const childScopes: Array<SQL | undefined> = [];
 	const ownerScopes: Array<SQL | undefined> = [];
 	const parentByOrigin = new Map<string, string | null>();
+	/**
+	 * 通过校验、可以有自己的 owner 的派发行。
+	 *
+	 * 分两遍是因为"来源被争抢"只能在看完全部派发行之后才知道，而它决定的是
+	 * **要不要**为这一行推入 owner 作用域（见下面第二遍的说明）。
+	 */
+	const dispatchableParents: Array<{
+		/** 本次派发的工具卡片（provider tool_use id）。 */
+		parentToolUseId: string;
+		/** 派发行的来源标识；非 COW 行就是它自己的行 id。 */
+		originId: string;
+		/** COW 副本必须落在**原始**派发行的编制者名下；原始行已删则为 null。 */
+		originParentNarratorId: string | null;
+	}> = [];
 	for (const parent of parents.values()) {
 		if (!SUBAGENT_TOOL_NAMES.has(parent.toolName)) {
 			childScopes.push(and(eq(narratorMessages.parentToolUseId, parent.toolUseId), callerChildRef));
@@ -2516,39 +2530,90 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 		// A deleted original cannot validate conflicting provider IDs on COW copies.
 		// Do not let the last copy bind an owner's EXISTS proof to another group.
 		parentByOrigin.set(originId, parentByOrigin.has(originId) ? null : parent.toolUseId);
+		dispatchableParents.push({
+			parentToolUseId: parent.toolUseId,
+			originId,
+			originParentNarratorId: original?.narratorId ?? null,
+		});
+	}
+	/**
+	 * owner 的两种来源，都写在派发时、都指向"这个 worker 与**本次**派发的关系"。
+	 *
+	 * 停放池允许同一个 worker 被派发多次（复用），于是"一次派发对一只 worker"不再成立：
+	 * `narrators.origin_tool_call_id` 是**单值**列，它只能记住首次派发（创建溯源，且被
+	 * ACL / revert / COW 校验共用，不能改写），复用那几次必须记在它之外——落在 worker
+	 * 那一轮消息的 `parent_tool_use_id` 上（首次派发由创建时的提示轮写下，复用派发由
+	 * 复用写入的那一轮写下）。
+	 *
+	 * 于是本次派发的 owner 是：**创建溯源就是本次派发**的 worker，或者**复用本次派发**
+	 * 的 worker（落点在本次卡片下、且创建溯源已知、且调用方血统已知）。查询从
+	 * `narrator_messages` 侧出发、按落点出行：同一只 worker 因此可以同时是页面上多次
+	 * 派发的执行者，历史派发互不覆盖、也不丢失。
+	 *
+	 * 落点比创建溯源弱（provider id 会重复），所以两条来源都还要求：创建溯源已知
+	 * （拒绝追溯不出创建者的 legacy 行）、调用方归属一致、这一轮消息确有作者引用；
+	 * 且同一张卡片上有两个不同 worker 时整组作废（见下方的 `group.size === 1`）。
+	 * 冒充他人工具调用的绑定因此拿不到 owner 位置。
+	 */
+	for (const candidate of dispatchableParents) {
+		if (parentByOrigin.get(candidate.originId) !== candidate.parentToolUseId) continue;
+		/**
+		 * "复用派发"这一条分支存在的**前提**是调用方血统已知。
+		 *
+		 * 落点（`parent_tool_use_id`）比创建溯源弱：provider 的 tool_use id 会重复
+		 * （历史被复制过、或干脆是伪造的），所以"某只 worker 有一轮消息落在同一张卡片下"
+		 * 本身不足以证明这次派发是它跑的。只有在调用方血统已知时（`originParentNarratorId`
+		 * 非空，即这次派发的编制者还能确认）下面那条 `parentNarratorId` 约束才有约束力；
+		 * 原始行已删的 COW 副本恰恰确认不了编制者，此时**只认创建溯源**——否则一只外来
+		 * worker 只要伪造一条落在同名 provider id 下的消息就能混进 owner 组，把真正的
+		 * 执行者挤成"归属不明"。
+		 */
+		const reuseBranches = candidate.originParentNarratorId
+			? [and(isNotNull(narrators.originToolCallId))]
+			: [];
 		ownerScopes.push(
 			and(
-				eq(narrators.originToolCallId, originId),
+				// 落点：这一轮消息必须落在**本次派发**的卡片下。首次派发由创建时的提示轮
+				// 落下，复用派发由复用写入的那一轮落下。
+				eq(narratorMessages.parentToolUseId, candidate.parentToolUseId),
+				or(
+					// 创建溯源即本次派发（新建，或 COW 副本仍能确认原始派发行）。
+					eq(narrators.originToolCallId, candidate.originId),
+					// 复用派发：创建溯源指向**别的一次**派发（首次那次），本次是复用它。
+					...reuseBranches,
+				),
 				eq(narrators.type, "subagent"),
 				sql`${narrators.variant} GLOB 'subagent:*'`,
-				original
-					? eq(narrators.parentNarratorId, original.narratorId)
+				candidate.originParentNarratorId
+					? eq(narrators.parentNarratorId, candidate.originParentNarratorId)
 					: isNotNull(narrators.parentNarratorId),
 				// Author refs prove that this owner still has real child history, but
 				// EXISTS never materializes its transcript merely to identify the owner.
-				sql`EXISTS (SELECT 1 FROM narrator_messages aggregate_child
-					INNER JOIN narrator_message_refs aggregate_author_ref
-					ON aggregate_author_ref.message_id = aggregate_child.id
+				sql`EXISTS (SELECT 1 FROM narrator_message_refs aggregate_author_ref
+					WHERE aggregate_author_ref.message_id = ${narratorMessages.id}
 					AND aggregate_author_ref.narrator_id = ${narrators.id}
-					AND aggregate_author_ref.segment_compact_id IS NULL
-					WHERE aggregate_child.narrator_id = ${narrators.id}
-					AND aggregate_child.parent_tool_use_id = ${parent.toolUseId})`,
+					AND aggregate_author_ref.segment_compact_id IS NULL)`,
 			),
 		);
 	}
 	// Budget distinct owner entities separately from caller-referenced inline rows.
 	// A child with a long transcript must not exhaust either metadata budget.
+	//
+	// 行是 (派发落点, worker) 对，同一个 worker 因此可以在页面上出现多次——这正是
+	// "一个 worker 可被派发多次"要表达的东西；`selectDistinct` 保证落点下的一整段
+	// 对话只算一个 owner 实体，不会把预算按消息条数吃掉。
 	const ownerRows = ownerScopes.length
 		? tx
-				.select({
+				.selectDistinct({
+					parentToolUseId: narratorMessages.parentToolUseId,
 					id: narrators.id,
-					originToolCallId: narrators.originToolCallId,
 					parentNarratorId: narrators.parentNarratorId,
 					variant: narrators.variant,
 					model: narrators.model,
 					reasoningEffort: narrators.reasoningEffort,
 				})
-				.from(narrators)
+				.from(narratorMessages)
+				.innerJoin(narrators, eq(narrators.id, narratorMessages.narratorId))
 				.where(or(...ownerScopes))
 				.limit(AGGREGATE_METADATA_LIMIT + 1)
 				.all()
@@ -2596,11 +2661,13 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 			});
 	}
 	for (const row of ownerRows) {
-		const parentToolUseId = row.originToolCallId && parentByOrigin.get(row.originToolCallId);
+		// 落点即归属：worker 是从哪张工具卡片下被派发的，就归哪一次派发。同一个 worker
+		// 可以在本页同时是多次派发的执行者（复用），所以这里不能再按创建溯源反推唯一卡片。
+		const parentToolUseId = row.parentToolUseId;
 		if (!parentToolUseId || !row.parentNarratorId || !isSubagentVariant(row.variant)) continue;
-		const group = ownerGroups.get(parentToolUseId) ?? new Map<string, SubagentActivityOwner>();
 		const parent = parents.get(parentToolUseId);
 		if (!parent) continue;
+		const group = ownerGroups.get(parentToolUseId) ?? new Map<string, SubagentActivityOwner>();
 		group.set(row.id, {
 			parentToolUseId,
 			subagentNarratorId: row.id,

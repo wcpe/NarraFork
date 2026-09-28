@@ -10,6 +10,7 @@ import {
 	FOLLOW_PARENT_MODEL,
 	type ModelAggregation,
 	type ModelOption,
+	ORCHESTRATION_PROVIDER_KEY,
 	resolveDisplayModel,
 } from "../../../lib/constants";
 import narratorLocale from "../../../locales/en/narrator.json";
@@ -26,6 +27,20 @@ const models: ModelOption[] = [
 	{ value: "a:one", label: "One", provider: "a" },
 	{ value: "a:two", label: "Two", provider: "a" },
 ];
+/** 一个四档齐全的编排方案选项（provider 即编排分组哨兵）。 */
+const orchestrationOption: ModelOption = {
+	value: "__orch__:prof1",
+	label: "Team profile",
+	provider: ORCHESTRATION_PROVIDER_KEY,
+	orchestration: {
+		id: "prof1",
+		name: "Team profile",
+		description: "Two-tier review pipeline",
+		orchestratorModels: ["a:one"],
+		tierPools: { chore: ["a:one"], quick: [], medium: ["a:two"], heavy: ["a:two"] },
+	},
+};
+const orchestrationModels: ModelOption[] = [...models, orchestrationOption];
 let root: Root;
 let host: HTMLDivElement;
 let instance: i18n;
@@ -37,6 +52,7 @@ let setAsDefault: string[];
 let setAsSummary: string[];
 let editDefault: number;
 let editSummary: number;
+let exitOrchestration: number;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
 
 beforeEach(async () => {
@@ -49,6 +65,7 @@ beforeEach(async () => {
 	setAsSummary = [];
 	editDefault = 0;
 	editSummary = 0;
+	exitOrchestration = 0;
 	const globals = {
 		window,
 		document: window.document,
@@ -109,6 +126,10 @@ async function render(
 		summaryModelValue?: string | null;
 		canFollowParent?: boolean;
 		inheritance?: SubagentModelInheritance | null;
+		/** 子代理上下文：编排分组整体隐藏。 */
+		hideOrchestration?: boolean;
+		/** 是否接上「退出编排模式」入口。 */
+		withOrchestrationExit?: boolean;
 	},
 ) {
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
@@ -136,6 +157,10 @@ async function render(
 									}}
 									defaultModelValue={options?.defaultModelValue}
 									summaryModelValue={options?.summaryModelValue}
+									hideOrchestration={options?.hideOrchestration}
+									{...(options?.withOrchestrationExit
+										? { onExitOrchestration: () => exitOrchestration++ }
+										: {})}
 									{...(withGlobalRoleActions
 										? {
 												onSetAsDefaultModel: (value: string) => setAsDefault.push(value),
@@ -164,6 +189,12 @@ function buttons() {
 function button(text: string) {
 	const found = buttons().find((item) => item.textContent === text);
 	if (!found) throw new Error(`Missing menu item: ${text}`);
+	return found;
+}
+/** 编排方案行：文本里除了方案名还有档位徽标与描述，不能按整段文本精确匹配。 */
+function orchestrationRow(name: string) {
+	const found = buttons().find((item) => item.textContent?.includes(name));
+	if (!found) throw new Error(`Missing orchestration row: ${name}`);
 	return found;
 }
 function prepareGeometry() {
@@ -401,6 +432,67 @@ describe("aggregation choices inside model menu", () => {
 	test("does not show aggregation members for ordinary models", async () => {
 		await render("a:one");
 		expect(host.textContent).not.toContain("Provider A · One");
+	});
+});
+
+describe("orchestration profiles in the model menu", () => {
+	test("renders the group with tier summaries and enters orchestration on select", async () => {
+		await render(null, orchestrationModels);
+		expect(host.textContent).toContain(narratorLocale.modelGroupOrchestration);
+		// 方案名 + 可辨识后缀，避免与同名模型行混淆。
+		expect(host.textContent).toContain(`Team profile · ${narratorLocale.orchestrationSuffix}`);
+		// 档位摘要按池是否非空给出徽标（quick 档为空）。
+		expect(host.textContent).toContain(`${narratorLocale.orchestrationTier_chore} 1`);
+		expect(host.textContent).toContain(`${narratorLocale.orchestrationTier_quick} 0`);
+		expect(host.textContent).toContain(`${narratorLocale.orchestrationTier_heavy} 1`);
+		// 选中方案写入的是哨兵值，交给编排入口而不是普通模型 PATCH。
+		await act(async () => orchestrationRow("Team profile").click());
+		expect(selected).toEqual(["__orch__:prof1"]);
+	});
+
+	test("expands the orchestrator models and the four tier pools", async () => {
+		await render("a:one", orchestrationModels);
+		await act(async () => {
+			host
+				.querySelector<HTMLElement>(`[aria-label='${narratorLocale.orchestrationDetails}']`)
+				?.click();
+		});
+		const info = host.querySelector("[data-orch-info='prof1']");
+		if (!info) throw new Error("Missing orchestration details");
+		// 编制者模型解析成可读名，四档池展开为空池给出明确说明。
+		expect(info.textContent).toContain("One");
+		expect(info.textContent).toContain(narratorLocale.orchestrationPoolEmpty);
+		expect(info.textContent).toContain("Two");
+		expect(selected).toEqual([]);
+	});
+
+	test("never offers a global role action on an orchestration row", async () => {
+		await render("a:one", orchestrationModels, true, true, { withGlobalRoleActions: true });
+		// 聚合行 + 两个具体模型行；编排方案不是模型，不能被写进全局槽位。
+		expect(host.querySelectorAll("[aria-label='Model actions']").length).toBe(3);
+	});
+
+	test("hides the group for a subagent context", async () => {
+		await render(null, orchestrationModels, true, true, { hideOrchestration: true });
+		expect(host.textContent).not.toContain(narratorLocale.modelGroupOrchestration);
+		expect(host.textContent).not.toContain("Team profile");
+		// 普通模型分组不受影响。
+		expect(host.textContent).toContain("One");
+	});
+
+	test("offers exiting orchestration only while a profile is selected", async () => {
+		await render("__orch__:prof1", orchestrationModels, true, true, {
+			withOrchestrationExit: true,
+		});
+		await act(async () => button(narratorLocale.orchestrationExit).click());
+		// 退出走的是专用回调（服务端据此落回默认模型语义），不是一次模型选择。
+		expect(exitOrchestration).toBe(1);
+		expect(selected).toEqual([]);
+	});
+
+	test("does not offer exiting orchestration outside orchestration mode", async () => {
+		await render("a:one", orchestrationModels, true, true, { withOrchestrationExit: true });
+		expect(host.textContent).not.toContain(narratorLocale.orchestrationExit);
 	});
 });
 

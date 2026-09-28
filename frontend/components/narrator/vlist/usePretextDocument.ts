@@ -109,6 +109,9 @@ export interface UsePretextDocumentOptions {
 	/** Whether an error card may offer the model probe. Shares the fix's measured
 	 * button row, so the same rebuild contract applies. */
 	canOfferModelTest?: (errorText: string) => boolean;
+	/** 编排 worker 的「换模型继续」是否可用。同样与上面两个按钮共用那条条件按钮行，
+	 * 因此同样要在构建选项中（身份一变就重建文档，卡片高度才会跟着变）。 */
+	canOfferOrchestrationModelSwitch?: (errorText: string) => boolean;
 	/** Resolve a tool item's pending-permission presence (live WS list). Its
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
@@ -394,6 +397,7 @@ export function usePretextDocument(
 			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
 			canOfferProviderFix: options.canOfferProviderFix,
 			canOfferModelTest: options.canOfferModelTest,
+			canOfferOrchestrationModelSwitch: options.canOfferOrchestrationModelSwitch,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
 			resolvePermissionFormPrediction: options.resolvePermissionFormPrediction,
 			resolvePermissionFormHeight: options.resolvePermissionFormHeight,
@@ -446,6 +450,9 @@ export function usePretextDocument(
 			options.canOfferProviderFix,
 			// Same reason: gaining or losing the probe button changes the card's height.
 			options.canOfferModelTest,
+			// 同一条约定：这条谓词由 narrator 的 subagentType 决定，身份变了就要重建，
+			// 否则换了会话（或 worker 被取消归档）后卡片还停在上一次的高度上。
+			options.canOfferOrchestrationModelSwitch,
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,

@@ -36,7 +36,6 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
@@ -47,7 +46,7 @@ import {
 	SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
 } from "../../../lib/safe-area";
 import { ContentViewer } from "../content/ContentViewer";
-import { useNarratorDockContext } from "../dock/NarratorDockContext";
+import { useOpenNarratorSession } from "../dock/open-narrator-session";
 import { ToolCallInspector } from "../tool-call/ToolCallInspector";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
 
@@ -334,10 +333,9 @@ export function BackgroundTasksPanel({
 	const { t } = useTranslation("narrator");
 	const [inspectedToolUseId, setInspectedToolUseId] = useState<string | null>(null);
 	const [expandedTaskIds, setExpandedTaskIds] = useState<ReadonlySet<string>>(() => new Set());
-	const navigate = useNavigate();
-	// When rendered inside a dock surface (single-narrator page or workspace),
-	// open subagent sessions as dockview panels; otherwise fall back to routing.
-	const dock = useNarratorDockContext();
+	// 在 dock 表面里把子会话开成相邻的 dockview 面板，否则回落为路由跳转——这条规则
+	// （含"判据是 bridge 而不是 dock 本身"的理由）只有一份实现，见该模块的文件头。
+	const openNarratorSession = useOpenNarratorSession();
 	const subagentsCapability = useNarratorSubagentsCapability();
 	const backgroundTasksSupported = subagentsCapability.supported && subagentsCapability.background;
 	const canOpenSubagentSessions = subagentsCapability.supported && subagentsCapability.detachAttach;
@@ -354,20 +352,11 @@ export function BackgroundTasksPanel({
 		(subagentNarratorId: string) => {
 			if (!canOpenSubagentSessions) return;
 			onOpenSubagent?.();
-			// Gate on the bridge, not on `dock`: a tool panel torn out onto the
-			// story-network canvas HAS a dock context but no secondary area to put a
-			// session in, so the bridge is absent while its source node is collapsed.
-			// Falling through to the standalone page is a real answer there — unlike
-			// `dock.openSubagentPanel(...)` through a `?.`, which would look like it
-			// worked and do nothing.
-			const openInDock = dock?.openSubagentPanel;
-			if (openInDock) {
-				openInDock(subagentNarratorId);
-			} else {
-				navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
-			}
+			// 「先试 dock、不行就路由」这条规则只有一份实现（`useOpenNarratorSession`），
+			// 与编排面板的代理行共用——两份各写一遍迟早会漂移成"一边点了没反应"。
+			openNarratorSession(subagentNarratorId);
 		},
-		[canOpenSubagentSessions, navigate, onOpenSubagent, dock],
+		[canOpenSubagentSessions, onOpenSubagent, openNarratorSession],
 	);
 
 	const handleToggleExpanded = useCallback((taskId: string) => {

@@ -286,6 +286,41 @@ describe("narrators API", () => {
 		expect(urls[1]?.search).toBe("?waitForIdle=1");
 	});
 
+	test("orchestration writes go to the dedicated endpoint, never the model route", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (url: string, init?: RequestInit) => {
+				requests.push({
+					url: new URL(url, "https://test.invalid").pathname,
+					method: init?.method,
+					body: init?.body ? JSON.parse(String(init.body)) : undefined,
+				});
+				return Response.json({ ok: true, model: "__orch__:prof1" });
+			},
+			configurable: true,
+		});
+
+		await api.updateNarratorOrchestration("narrator-1", "prof1");
+		await api.updateNarratorOrchestration("narrator-1", null);
+		expect(requests).toEqual([
+			{
+				url: "/api/narrators/narrator-1/orchestration",
+				method: "PATCH",
+				body: { profileId: "prof1" },
+			},
+			{
+				url: "/api/narrators/narrator-1/orchestration",
+				method: "PATCH",
+				// null 是显式退出；省略这个字段会被服务端当成「必须带 profileId」而报错。
+				body: { profileId: null },
+			},
+		]);
+	});
+
 	test("encodes raw tool row refs without treating the provider ID as a PK", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

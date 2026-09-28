@@ -106,6 +106,8 @@ export interface ComputeLayoutOptions {
 	canOfferProviderFix?: (errorText: string) => boolean;
 	/** Same measured-row contract as canOfferProviderFix; shares that button row. */
 	canOfferModelTest?: (errorText: string) => boolean;
+	/** 编排 worker 的「换模型继续」；同样与上面两个按钮共用那条条件按钮行。 */
+	canOfferOrchestrationModelSwitch?: (errorText: string) => boolean;
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
@@ -191,6 +193,7 @@ export function computePretextVListLayout(
 		resolveSubagentRecentSummary: opts.resolveSubagentRecentSummary,
 		canOfferProviderFix: opts.canOfferProviderFix,
 		canOfferModelTest: opts.canOfferModelTest,
+		canOfferOrchestrationModelSwitch: opts.canOfferOrchestrationModelSwitch,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
 		resolvePermissionFormPrediction: opts.resolvePermissionFormPrediction,
 		resolvePermissionFormHeight: opts.resolvePermissionFormHeight,

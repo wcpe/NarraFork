@@ -694,6 +694,13 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// but the takeover patch writes it ALONE (the card stays `running` throughout),
 	// which makes this the only key component that can move.
 	if (d.isTakenOver === true) rev += "|gw:1";
+	// 编排 worker 的「换模型继续」（阶段 6）。两个新增字段都落在同一条固定 badge 行 /
+	// 同一段 header 上，因此高度中性——但都在模型等待态到来/结束时**单独**变化
+	// （调用状态全程是 running，别的东西不会动），所以必须进 key，否则卡片会继续
+	// 画着旧的只读 badge，用户看不到"这里可以换模型"。
+	if (d.modelWait) rev += `|gmw:${JSON.stringify(d.modelWait)}`;
+	if (typeof d.workerTier === "string") rev += `|gwt:${d.workerTier}`;
+	if (typeof d.workerKind === "string") rev += `|gwk:${d.workerKind}`;
 	// Measured bodies: the description wraps when expanded, the prompt and result
 	// are measured up to their caps.
 	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;

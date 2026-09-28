@@ -67,6 +67,9 @@ import {
 	parseTraits,
 	redactDraftTraits,
 } from "../lib/narrator-utils";
+import { resolveConfiguredOrchestratorReasoningEffort } from "../lib/orchestration/orchestrator-effort";
+import { resolveExecutionAllowedTools } from "../lib/orchestration/tier-definition";
+import { buildOrchestratorPrompt } from "../lib/orchestration/tier-prompts";
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
@@ -76,6 +79,7 @@ import {
 	getAutoCompactKeepPairs,
 	getContextThresholds,
 	getSettingsRevision,
+	parseOrchestrationModelValue,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -1069,6 +1073,11 @@ export async function buildSystemPrompt(
 		allowLocalExecution?: boolean;
 	},
 	planFilePath?: string,
+	/**
+	 * 编排方案 ID（非空即该会话处于编排模式），由调用方从 `model` 的
+	 * `__orch__:` 哨兵解析后传入。本函数只负责把编制者提示词追加进去。
+	 */
+	orchestrationProfileId?: string | null,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
@@ -1084,6 +1093,10 @@ export async function buildSystemPrompt(
 		devices: deviceContext?.devices,
 		defaultDeviceId: deviceContext?.defaultDeviceId,
 		allowLocalExecution: deviceContext?.allowLocalExecution,
+		orchestrationPrompt: orchestrationProfileId ? buildOrchestratorPrompt(locale) : undefined,
+		// cwd / Execution Devices / Dynamic Spec 三段按编制者工具面改写。
+		// 与 orchestrationPrompt 同源，避免"提示词是编制者版、工具段落却还是普通版"。
+		orchestratorMode: Boolean(orchestrationProfileId),
 	});
 }
 
@@ -1219,6 +1232,7 @@ async function createNarrator(
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
 		planFilePath,
+		parseOrchestrationModelValue(narrator.model)?.profileId,
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -1254,6 +1268,17 @@ async function createNarrator(
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
 	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
 	const narratorProvider = resolveProvider(narratorModel);
+	// 编排模式由 model 的哨兵承载；解析失败即视为普通会话（历史脏值不该让
+	// 一次会话装配整体失败，闸门缺失只会退化成普通 primary，不是安全问题）。
+	const orchestrationProfileId = parseOrchestrationModelValue(narrator.model)?.profileId;
+	/** 本会话生效的思考强度；三档优先级的完整说明见 `resolveSessionReasoningEffort`。 */
+	const sessionReasoningEffort = resolveSessionReasoningEffort({
+		provider: narratorProvider,
+		model: narratorModel,
+		inherited: inheritedModel?.reasoningEffort,
+		explicit: narrator.reasoningEffort,
+		orchestrationProfileId,
+	});
 
 	const active: ActiveNarrator = {
 		abortController,
@@ -1272,12 +1297,7 @@ async function createNarrator(
 		model: narratorModel,
 		provider: narratorProvider,
 		_reasoningEffortRef: narrator.reasoningEffort ?? null,
-		reasoningEffort:
-			(inheritedModel
-				? subagentRunReasoningEffort(inheritedModel, narrator.reasoningEffort)
-				: narrator.reasoningEffort) ??
-			resolveDefaultReasoningEffort(narratorProvider, narratorModel) ??
-			null,
+		reasoningEffort: sessionReasoningEffort,
 		systemPrompt: effectiveSystemPrompt,
 		events,
 		alive: true,
@@ -1298,6 +1318,7 @@ async function createNarrator(
 		_skillScopeKey: skillScopeKey,
 		_enabledOptionalTools: new Set(),
 		_disabledTools: getDisabledToolSet(creationTraits.traits),
+		_orchestrationProfileId: orchestrationProfileId,
 		_blockedSkills: getBlockedSkills(creationTraits.traits),
 		_narratorKind: isKnowledgeStewardNarrator(narrator.traits) ? "knowledge" : undefined,
 		_interruptCleanupDone: false,
@@ -5553,7 +5574,14 @@ async function reExecuteDeniedToolCallUnlocked(
 					parentNarratorId,
 					parentToolUseId,
 					reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
-					allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
+					// 这里是**第二条执行路径**（重跑被拒/被打断的工具调用），它会重建一份
+					// 全新的 AgentConfig，因此执行期闸门必须与主循环一致地下发——只在
+					// orchestrator.ts 装配处设闸，重跑这条路会成为一个静默的旁路。
+					// 非编制者与改动前逐字等价：有 OAuth 白名单就照抄，没有就是 undefined。
+					allowedTools: resolveExecutionAllowedTools({
+						isOrchestrator: !isSubagent && active._orchestrationProfileId !== undefined,
+						oauthAllowedTools: oauthRuntime?.allowedTools,
+					}),
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
 					onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
 						narratorId,
@@ -7659,6 +7687,41 @@ export function resolveRuntimeReasoningEffort(
 	return reasoningEffort ?? resolveDefaultReasoningEffort(provider, model) ?? null;
 }
 
+/**
+ * 一个会话最终生效的思考强度。
+ *
+ * 优先级是**三档**，顺序刻意如此：
+ * 1. `inherited`——跟随父级的子代理拿到的值（最高：它是上游会话的明确选择）；
+ * 2. `explicit`——用户为**这个会话**显式选的值（状态栏那一档）；
+ * 3. 编排配置——配置侧为编制者指定的等级；
+ * 4. provider/settings 默认。
+ *
+ * 2 与 3 的次序是这条链上唯一有争议的地方：编排配置排在用户选择**之后**，是因为
+ * 设置页那一项描述的是"编制者默认该多用力"，而手动选择是针对**这一次会话**的覆盖；
+ * 反过来排会让用户永远调不动一个编排会话。它又必须排在默认值**之前**，否则这一项
+ * 配置就完全无效果——它存在的全部意义就是压过默认值。
+ *
+ * 写成纯函数是为了让这条顺序可以被直接断言。散在四个调用点里手写三元链时，任何一处
+ * 写反了都只是"配置看起来配上了、实际不生效"，没有任何错误信号。
+ */
+export function resolveSessionReasoningEffort(input: {
+	provider: string;
+	model: string;
+	/** 跟随父级继承来的值（仅子代理可能非空）。 */
+	inherited?: ReasoningEffort | null;
+	/** 该会话自己记录的选择（`narrators.reasoning_effort`）。 */
+	explicit?: ReasoningEffort | null;
+	/** 编排方案 id：只有编制者会传，传空表示这个会话不读编排配置。 */
+	orchestrationProfileId?: string | null;
+}): ReasoningEffort | null {
+	const configured = resolveConfiguredOrchestratorReasoningEffort(input.orchestrationProfileId);
+	return resolveRuntimeReasoningEffort(
+		input.provider,
+		input.model,
+		input.inherited ?? input.explicit ?? configured,
+	);
+}
+
 export const inheritedModelRuntime = createInheritedModelRuntime({
 	getActive: (id) => activeNarrators.get(id),
 	activeValues: () => activeNarrators.values(),
@@ -7681,11 +7744,13 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 		active._settingsRevision = resolved.settingsRevision;
 		active._inheritedReasoningEffort = resolved.reasoningEffort;
 		active._parentReasoningEffort = resolved.parentReasoningEffort;
-		active.reasoningEffort = resolveRuntimeReasoningEffort(
-			active.provider,
-			active.model,
-			subagentRunReasoningEffort(resolved, active._reasoningEffortRef),
-		);
+		active.reasoningEffort = resolveSessionReasoningEffort({
+			provider: active.provider,
+			model: active.model,
+			inherited: resolved.reasoningEffort,
+			explicit: active._reasoningEffortRef,
+			orchestrationProfileId: active._orchestrationProfileId,
+		});
 		broadcastToNarrator(active.narratorId, {
 			type: "model_changed",
 			narratorId: active.narratorId,
@@ -7734,6 +7799,9 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			return;
 		}
 		active._modelRef = model || FOLLOW_DEFAULT_MODEL;
+		// 编排状态与 model 同源：任何写 model 的路径（PATCH /:id/model、
+		// PATCH /:id/orchestration、fork）都在这里同步，不靠各调用点各自记得更新。
+		active._orchestrationProfileId = parseOrchestrationModelValue(model)?.profileId;
 		active._settingsRevision = getSettingsRevision();
 		const effectiveModel = resolveEffectiveModel(active._modelRef, active.provider);
 		active.model = effectiveModel;
@@ -7783,17 +7851,16 @@ export function updateNarratorReasoningEffort(
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
 		active._reasoningEffortRef = reasoningEffort;
-		active.reasoningEffort = resolveRuntimeReasoningEffort(
-			active.provider,
-			active.model,
-			subagentRunReasoningEffort(
-				{
-					reasoningEffort: active._inheritedReasoningEffort,
-					parentReasoningEffort: active._parentReasoningEffort,
-				},
-				reasoningEffort,
-			),
-		);
+		// 用户把覆盖清成 null（"跟随默认"）时必须继续落到编排配置上，而不是直接跳到
+		// provider 默认：否则在编排会话里"清空选择"会顺手把设置页里配的那一项也一起
+		// 屏蔽掉，而界面上没有任何地方会提到这件事。
+		active.reasoningEffort = resolveSessionReasoningEffort({
+			provider: active.provider,
+			model: active.model,
+			inherited: active._inheritedReasoningEffort,
+			explicit: reasoningEffort,
+			orchestrationProfileId: active._orchestrationProfileId,
+		});
 		broadcastToNarrator(narratorId, {
 			type: "model_settings_changed",
 			narratorId,

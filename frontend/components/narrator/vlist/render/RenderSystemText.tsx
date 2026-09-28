@@ -30,6 +30,7 @@ import {
 } from "@mantine/core";
 import {
 	IconAlertTriangle,
+	IconArrowsExchange,
 	IconEraser,
 	IconGitFork,
 	IconListCheck,
@@ -114,6 +115,16 @@ export interface ErrorNoticeActions {
 	 * shell, which is also what hosts the dialog.
 	 */
 	onTestModel?: () => void;
+	/**
+	 * 编排 worker 的「换模型继续」：换一个模型让它带着已有上下文接着干。
+	 *
+	 * 与上面两个按钮同一条约定：按钮存不存在由适配器决定（它占一行，因此
+	 * `data.buttons` 里带着它的标签），这里只负责让画出来的按钮可点。所以
+	 * "这个错误是不是编排 worker 的"在适配器侧判完，这里不做任何资格判断。
+	 */
+	onSwitchModel?: () => void;
+	/** 换模型请求在飞（把按钮置为加载态）。 */
+	switchingModel?: boolean;
 }
 
 /**
@@ -346,6 +357,7 @@ function ErrorCard({
 	};
 	const fixLabel = labelFor("disableImageGen");
 	const modelTestLabel = labelFor("testCurrentModel");
+	const switchModelLabel = labelFor("switchOrchestrationModel");
 	return (
 		<Paper
 			p="xs"
@@ -385,8 +397,8 @@ function ErrorCard({
 						</>
 					) : null}
 				</Group>
-				{showActions && (fixLabel || modelTestLabel) ? (
-					// One row for both: the measure layer reserves a single
+				{showActions && (fixLabel || modelTestLabel || switchModelLabel) ? (
+					// One row for all of them: the measure layer reserves a single
 					// BUTTON_COMPACT_XS row whenever any button qualifies, so a second
 					// button must cost width rather than height.
 					<Group gap={GROUP_GAP} wrap="nowrap">
@@ -413,6 +425,20 @@ function ErrorCard({
 								onClick={actions?.onTestModel}
 							>
 								{modelTestLabel}
+							</Button>
+						) : null}
+						{switchModelLabel ? (
+							<Button
+								data-testid="error-switch-worker-model"
+								size="compact-xs"
+								variant="light"
+								color="teal"
+								leftSection={<IconArrowsExchange size={12} />}
+								loading={actions?.switchingModel === true}
+								disabled={!actions?.onSwitchModel}
+								onClick={actions?.onSwitchModel}
+							>
+								{switchModelLabel}
 							</Button>
 						) : null}
 					</Group>

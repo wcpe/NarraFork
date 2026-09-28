@@ -17,6 +17,7 @@
  * the row's tool metadata (vlist-tool-meta.ts).
  */
 
+import { isOrchestrationWorkerType } from "@shared/orchestration-worker-type";
 import type { RevertScope } from "../../../lib/api/narrators";
 import type {
 	CustomMessageMenuItem,
@@ -111,6 +112,14 @@ export interface VListRowHandlers {
 	 * rowActionHandlerDependencies keys on it.
 	 */
 	customMessageActions?: (messageId: string) => CustomMessageMenuItem[] | undefined;
+	/**
+	 * 编排 worker 的「换模型继续」（阶段 6）。由 shell 提供（它拥有选择器模态框），
+	 * 行只报"要救哪个 worker、它是什么类型"。
+	 *
+	 * 刻意不做成右键菜单项：入口画在子代理卡片的模型 badge 上——等待中的卡片上，
+	 * badge 就是唯一"有话要说"的地方。
+	 */
+	onSwitchWorkerModel?: (workerNarratorId: string, workerType: string) => void;
 }
 
 /**
@@ -136,6 +145,7 @@ export function rowActionHandlerDependencies(
 		handlers?.onCancelBackgroundTask,
 		handlers?.onOpenFilePanel,
 		handlers?.customMessageActions,
+		handlers?.onSwitchWorkerModel,
 	];
 }
 
@@ -159,6 +169,11 @@ export interface VListRowToolActions {
 	onCancelBackgroundTask?: () => void;
 	/** "Open in panel" — a file-oriented tool's path, bound to the dock host. */
 	onOpenFilePanel?: () => void;
+	/**
+	 * 编排 worker 的「换模型继续」：绑定在子代理卡片的模型 badge 上
+	 * （不是菜单项，见 `VListRowHandlers.onSwitchWorkerModel`）。
+	 */
+	onSwitchWorkerModel?: () => void;
 }
 
 /**
@@ -205,6 +220,17 @@ export function buildRowToolActions(
 	// Agent call that created it. Detaching or cancelling from here would act on a
 	// narrator this row never owned.
 	const childNarratorId = meta.subagentNarratorId;
+	// 编排 worker 的换模型入口（阶段 6）。绑定条件只看"是不是编排 worker + 有没有
+	// 子代理 id"：**是否处于等待态**由渲染层按实时数据决定（`modelWait`），因为它是
+	// 一个只存在于运行期的运行事实，把它折进行动作的绑定会让整行的记忆化键
+	// 跟着等待态抖动。
+	if (childNarratorId && meta.subagentType && handlers.onSwitchWorkerModel) {
+		const workerType = meta.subagentType;
+		if (isOrchestrationWorkerType(workerType)) {
+			actions.onSwitchWorkerModel = () =>
+				handlers.onSwitchWorkerModel?.(childNarratorId, workerType);
+		}
+	}
 	if (childNarratorId) {
 		if (handlers.onDetachSubagent && !meta.isBackground && !meta.isTerminal) {
 			actions.onDetachSubagent = () => handlers.onDetachSubagent?.(childNarratorId);

@@ -53,6 +53,12 @@ export interface VListToolMeta {
 	toolName?: string;
 	/** Subagent card: the child narrator id, when the activity summary knows it. */
 	subagentNarratorId?: string;
+	/**
+	 * Subagent card: the child's raw type string (`input.subagent_type`)。编排 worker
+	 * 的类型编码（`orch--…` / `orch-review--…`）就藏在这里，而它是"能不能换模型继续"
+	 * 的唯一权威来源——因此从原始输入读，不从 narrator 行推断。
+	 */
+	subagentType?: string;
 	/** Active Await({type:"question"}): the inbox question id. */
 	awaitQuestionId?: string;
 	/** Message seq of the tool_use that owns awaitQuestionId (latest wait wins). */
@@ -238,6 +244,8 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	}
 	const subagentNarratorId = nonEmpty(activity.subagentNarratorId);
 	if (subagentNarratorId) meta.subagentNarratorId = subagentNarratorId;
+	const subagentType = nonEmpty(inputRecord.subagent_type);
+	if (subagentType) meta.subagentType = subagentType;
 	const awaitTargetId = deriveAwaitAgentTargetId(toolName, input, metadata);
 	if (awaitTargetId) {
 		meta.awaitAgentTargetId = awaitTargetId;

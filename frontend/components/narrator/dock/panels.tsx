@@ -14,13 +14,25 @@
  * by the chat panel), so they can live as dockview siblings of chat.
  */
 
-import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Box,
+	Center,
+	Divider,
+	Group,
+	Loader,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { FileReferenceEditorSelection, FileTarget } from "@shared/file-reference";
 import {
 	IconFileText,
 	IconFlask,
 	IconFolder,
+	IconGauge,
 	IconGitBranch,
 	IconInfoCircle,
 	IconMessages,
@@ -34,12 +46,28 @@ import {
 } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import type { IDockviewPanelHeaderProps, IDockviewPanelProps } from "dockview-react";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
+import { useOrchestrationStatus } from "../../../hooks/useOrchestrationStatus";
+import { useOrchestrationUsage } from "../../../hooks/useOrchestrationUsage";
+import { useOrchestrationWorkerLive } from "../../../hooks/useOrchestrationWorkerLive";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
+import {
+	mergeOrchestrationWorkers,
+	orchestrationRefetchIntervalMs,
+} from "../../../lib/orchestration-worker-live";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { getFilePreviewType } from "../file-panel/FilePreviewModal";
@@ -49,6 +77,9 @@ import {
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
 import { LargeFileGate } from "../file-panel/LargeFileGate";
+import { OrchestrationStatusDetails } from "../interaction/OrchestrationStatusPopover";
+import { OrchestrationUsageDetails } from "../interaction/OrchestrationUsageDetails";
+import { OrchestrationWorkerList } from "../interaction/OrchestrationWorkerList";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
@@ -63,6 +94,7 @@ import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { FocusChatSlot } from "./FocusChatHost";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
+import { useOpenNarratorSession } from "./open-narrator-session";
 
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
@@ -829,6 +861,124 @@ export function AppearanceDockPanel(props: IDockviewPanelProps<NarratorBoundPane
 	);
 }
 
+// ── Orchestration run status + token usage ──
+/**
+ * 编排状态的**详情**面板。
+ *
+ * 与状态栏里那个 Popover 的分工：Popover 是速览（一眼看清容量配得对不对），
+ * 面板是详情，且它的存在理由与 `appearance` 面板相同——要在一次派发跑着的**同时**
+ * 就摆在对话旁边，而不是点开一个盖住内容的弹层。
+ *
+ * **刻意不重复实现同一份展示**：三块正文都是纯组件，直接复用
+ * （`OrchestrationStatusDetails` 就是 Popover 里那一个，代理清单则由
+ * `OrchestrationWorkerList` 提供）。
+ *
+ * 两个查询各自**只在面板真的打开时**开启（面板挂载 = 打开），并且都走按需拉取：
+ * 编排状态是观测数据，没有任何渲染决策依赖它，常驻轮询只会给主线程的 SQLite 加负载。
+ * 状态查询的间隔是**动态**的：`subagent_status_changed` / `context_usage` 事件在流动时
+ * 面板由事件驱动，轮询降级为低频兜底；事件长时间未达才回到基线间隔。这里刻意
+ * **不**用"把间隔调小"来假装实时。
+ *
+ * 不懒加载：它引用的三个正文组件本身很小，而这里没有别的重依赖，
+ * 拆成 chunk 只会多一层 Suspense 边界。
+ */
+export function OrchestrationDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+	const { t } = useTranslation("narrator");
+	// 点代理行看它的会话：与后台任务里的 agent 行走**同一个**打开函数
+	// （dock 优先、回落路由），不在这里再写一份。
+	const openWorkerSession = useOpenNarratorSession();
+
+	useLayoutEffect(() => {
+		const title = t("orchestrationPanelTitle");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	const { overlay, lastEventAtMs, disconnected } = useOrchestrationWorkerLive(narratorId, true);
+	const status = useOrchestrationStatus(narratorId, {
+		enabled: true,
+		// 兜底间隔由"最近有没有收到过事件"决定（见 `orchestrationRefetchIntervalMs`）。
+		// 每次渲染重算是有意的：持久化窗口过期后，下一次轮询造成的渲染就会把间隔
+		// 自动调回基线，不需要额外的定时器。
+		refetchIntervalMs: orchestrationRefetchIntervalMs({ lastEventAtMs, now: Date.now() }),
+	});
+	const usage = useOrchestrationUsage(narratorId, { enabled: true });
+
+	const workers = useMemo(
+		() => mergeOrchestrationWorkers({ workers: status.data?.workers ?? [], overlay }),
+		[status.data?.workers, overlay],
+	);
+
+	return (
+		<ToolPanelShell
+			title={t("orchestrationPanelTitle")}
+			icon={<IconGauge size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__orchestration__"
+			detachKind="orchestration"
+		>
+			<Stack gap="md" p="md">
+				{/* 代理清单在最前：面板打开时"现在有哪几只、各自什么状态、上下文多满"
+				    是最需要一眼看到的东西，而它随事件实时变化。 */}
+				<Text size="xs" fw={600}>
+					{t("orchestrationPanelWorkers")}
+				</Text>
+				{disconnected && (
+					<Text size="xs" c="orange" data-testid="orchestration-ws-disconnected">
+						{t("orchestrationWsDisconnected")}
+					</Text>
+				)}
+				{status.isError ? (
+					<Text size="xs" c="red">
+						{t("orchestrationStatusFailed")}
+					</Text>
+				) : status.isFetching && !status.data ? (
+					<Text size="xs" c="dimmed">
+						{t("orchestrationStatusLoading")}
+					</Text>
+				) : !status.data ? (
+					<Text size="xs" c="dimmed">
+						{t("orchestrationStatusUnavailable")}
+					</Text>
+				) : (
+					<OrchestrationWorkerList
+						workers={workers}
+						workerCount={status.data.workerCount}
+						truncated={status.data.workersTruncated}
+						nowMs={Date.now()}
+						t={t}
+						onOpenWorker={openWorkerSession}
+					/>
+				)}
+
+				<Divider />
+
+				{/* 开销其次："这次编排花了多少"是打开这个面板的主要动机之一。 */}
+				<Text size="xs" fw={600}>
+					{t("orchestrationPanelUsage")}
+				</Text>
+				<OrchestrationUsageDetails
+					usage={usage.data ?? null}
+					loading={usage.isFetching && !usage.data}
+					failed={usage.isError}
+					t={t}
+				/>
+
+				<Divider />
+
+				<OrchestrationStatusDetails
+					status={status.data ?? null}
+					loading={status.isFetching && !status.data}
+					failed={status.isError}
+					t={t}
+				/>
+			</Stack>
+		</ToolPanelShell>
+	);
+}
+
 // ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
 export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
@@ -1190,6 +1340,7 @@ export const narratorDockComponents: Record<
 	search: SearchDockPanel,
 	userchat: UserChatDockPanel,
 	appearance: AppearanceDockPanel,
+	orchestration: OrchestrationDockPanel,
 	subagent: SubagentDockPanel,
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,

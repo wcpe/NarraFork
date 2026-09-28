@@ -18,6 +18,10 @@ import {
 } from "./context-management/context-usage-state";
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
+import {
+	applySubagentModelWaitToCachedRow,
+	subagentModelWaitFromEvent,
+} from "./model/worker-model-switch";
 import type {
 	ContentBlock,
 	NarratorMsg,
@@ -333,6 +337,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	} = opts;
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
+	/**
+	 * 子代理的显示名，用于"是哪个 worker 卡住了"的通知文案。
+	 *
+	 * 读缓存而不是再发一次请求：子代理行的数据已经在 `["narrators", id]` 里，
+	 * 为了一条通知去拉一次详情既慢又可能落到一个还没加载过的会话上。读不到就退回
+	 * id 前缀——一个短 id 仍是可辨认的，而空字符串会让整句话读不通。
+	 */
+	const workerLabel = useCallback(
+		(id: string): string => {
+			const row = qc.getQueryData(["narrators", id]) as
+				| { title?: string | null; alias?: string | null }
+				| undefined;
+			return row?.title?.trim() || row?.alias?.trim() || id.slice(0, 8);
+		},
+		[qc],
+	);
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const permissionDecisionsSupported =
 		narratorPermissionsCapability.supported && narratorPermissionsCapability.approveDeny;
@@ -1482,6 +1502,83 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						: old,
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+			},
+			// 子代理被停在模型不可用 / 配额等待上。此前这个帧被静默丢弃，父级面板
+			// 只知道子代理"在跑"却看不到它卡在哪，也没有任何可操作的提示。
+			//
+			// 视觉语言照抄父叙述者那条同类事件（见上方 onModelUnavailableWaiting）：
+			// 状态标记用同一个 substatus 取色、通知不可自动关闭（它描述的是一个
+			// 需要用户决定的状态，不是一个"完成"提示），只有作用对象换成了子代理行。
+			onSubagentModelUnavailableWaiting: (subagentNarratorId, info) => {
+				const isQuota = info.waitKind === "quota";
+				const substatus = isQuota ? "quota_exhausted" : "model_unavailable";
+				qc.setQueryData(
+					["narrators", subagentNarratorId],
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+					(old: any) =>
+						old
+							? {
+									...applySubagentModelWaitToCachedRow(
+										old as Record<string, unknown>,
+										subagentModelWaitFromEvent(info),
+									),
+									substatus: [substatus],
+								}
+							: old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+				notifications.show({
+					id: `subagent-model-unavailable-${subagentNarratorId}`,
+					title: t(
+						isQuota ? "subagentQuotaExhaustedWaitingTitle" : "subagentModelUnavailableWaitingTitle",
+					),
+					message: isQuota
+						? t("subagentQuotaExhaustedWaitingDesc", {
+								model: info.model,
+								worker: workerLabel(subagentNarratorId),
+								resetAt: info.resumeAt
+									? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
+									: t("quotaExhaustedResetUnknown"),
+							})
+						: t("subagentModelUnavailableWaitingDesc", {
+								model: info.model,
+								worker: workerLabel(subagentNarratorId),
+							}),
+					color: statusRegistry.accentColor(statusRegistry.narratorSubstatus(substatus)),
+					autoClose: false,
+				});
+			},
+			onSubagentModelUnavailableRecovered: (subagentNarratorId, info) => {
+				const isQuota = info.waitKind === "quota";
+				notifications.hide(`subagent-model-unavailable-${subagentNarratorId}`);
+				qc.setQueryData(
+					["narrators", subagentNarratorId],
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+					(old: any) =>
+						old
+							? {
+									...applySubagentModelWaitToCachedRow(old as Record<string, unknown>, null),
+									status: "working",
+									substatus: [],
+								}
+							: old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+				notifications.show({
+					title: t(
+						isQuota
+							? "subagentQuotaExhaustedRecoveredTitle"
+							: "subagentModelUnavailableRecoveredTitle",
+					),
+					message: t(
+						isQuota
+							? "subagentQuotaExhaustedRecoveredDesc"
+							: "subagentModelUnavailableRecoveredDesc",
+						{ model: info.model, worker: workerLabel(subagentNarratorId) },
+					),
+					color: "green",
+					autoClose: 4000,
+				});
 			},
 			onSubagentWarning: (
 				subagentNarratorId: string,

@@ -546,6 +546,11 @@ export const ExactRow = memo(
 					if (subToolActions?.onViewSubagentSession) {
 						subExtra.onOpenSession = subToolActions.onViewSubagentSession;
 					}
+					// Same binding as the standalone card above: whether the badge is
+					// clickable is decided by the render layer from `modelWait`.
+					if (subToolActions?.onSwitchWorkerModel) {
+						subExtra.onSwitchWorkerModel = subToolActions.onSwitchWorkerModel;
+					}
 					if (viewControls) {
 						const subData = cardData as { resultText?: unknown; agentType?: unknown };
 						const description =
@@ -756,6 +761,12 @@ export const ExactRow = memo(
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+			}
+			// 编排 worker 的模型 badge（阶段 6）。绑定是无条件的：**要不要**
+			// 变成可点由渲染层按 `modelWait` 决定（等待态是运行期事实，渲染层拿到的
+			// 才是最新的那一份），这里只负责把"点了叫谁"接上。
+			if (interaction?.toolActions?.onSwitchWorkerModel) {
+				extra.onSwitchWorkerModel = interaction.toolActions.onSwitchWorkerModel;
 			}
 			// Prompt fold. Same story as onOpenSession: RenderSubagent drew the
 			// chevron row but nothing supplied the handler, so clicking it did
