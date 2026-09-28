@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	applyPendingMigrationsByHash,
+	backfillFastModeOverride,
+	backfillNarratorVisibility,
 	repairMissingSpecTables,
 	runMigrations,
 	SpecSchemaDriftError,
@@ -624,6 +626,13 @@ describe("terminal_view_state cascade deletes (real migration replay)", () => {
  * high-water mark was polluted by a branch/version carrying larger migration timestamps.
  * Reproduces the real production incident: a fully-migrated database that "loses" a table
  * because Drizzle's built-in migrate() would skip re-applying the migration that creates it.
+ *
+ * 历史迁移序列现在只剩一条 `0000_baseline`，于是把两件事分开验证：
+ *   - “水位被污染后重建缺失表”仍可在真实 journal 上端到端复现——基线的 hash 就是唯一
+ *     的水位来源；
+ *   - “目标表已存在的破坏性迁移不得重跑”在单条基线下不可能自然发生（基线全是
+ *     `CREATE ... IF NOT EXISTS`，没有任何破坏性迁移），因此改为把真实执行器
+ *     `applyPendingMigrationsByHash` 打在一个专门构造的迁移文件夹上。
  */
 describe("hash-based migration self-heal", () => {
 	function tableExists(database: Database, name: string): boolean {
@@ -649,23 +658,81 @@ describe("hash-based migration self-heal", () => {
 		)?.hash;
 	}
 
-	// folderMillis of the migration that creates narrator_tool_continuations (0090) — a
-	// pure additive migration — and of a destructive rebuild migration (0028 benchmark_runs).
-	const TOOL_CONTINUATIONS_WHEN = 1784524348158; // 0090_public_nextwave
-	const BENCHMARK_RUNS_WHEN = 1777102252438; // 0028_pale_silhouette (DROP+RENAME rebuild)
+	// folderMillis of the single surviving journal entry.
+	const BASELINE_WHEN = 1784925778846; // 0000_baseline
+
+	const tempFolders: string[] = [];
+
+	afterEach(() => {
+		for (const folder of tempFolders.splice(0)) rmSync(folder, { recursive: true, force: true });
+	});
+
+	const DESTRUCTIVE_WHEN = 1_700_000_000_000;
+	const LATER_WHEN = 1_700_000_000_001;
+
+	/**
+	 * 一个两条 journal 条目的迁移文件夹：第一条是破坏性重建（DROP + 建空表），第二条
+	 * 是它之后的正常迁移。
+	 *
+	 * 单条基线里全是 `CREATE ... IF NOT EXISTS`，没有任何破坏性迁移，因此“已生效但
+	 * 未盖章的破坏性迁移不得重跑”这条机制只能靠构造出来的迁移文件夹触发。重建之所以
+	 * 危险，正是因为它是“DROP 后建空表”，重跑会丢掉首次重建之后写入的活数据——这同时
+	 * 也让“是否真的重跑过”变成可观测的。
+	 */
+	function migrationsFolderWithDestructiveRebuild(): string {
+		const root = mkdtempSync(join(tmpdir(), "narrafork-self-heal-"));
+		tempFolders.push(root);
+		const folder = join(root, "drizzle");
+		mkdirSync(join(folder, "meta"), { recursive: true });
+		writeFileSync(
+			join(folder, "meta", "_journal.json"),
+			JSON.stringify({
+				version: "7",
+				dialect: "sqlite",
+				entries: [
+					{
+						idx: 0,
+						version: "6",
+						when: DESTRUCTIVE_WHEN,
+						tag: "0000_destructive_rebuild",
+						breakpoints: true,
+					},
+					{
+						idx: 1,
+						version: "6",
+						when: LATER_WHEN,
+						tag: "0001_afterward",
+						breakpoints: true,
+					},
+				],
+			}),
+		);
+		writeFileSync(
+			join(folder, "0000_destructive_rebuild.sql"),
+			[
+				"DROP TABLE `benchmark_runs`;",
+				"CREATE TABLE `benchmark_runs` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL);",
+			].join("\n--> statement-breakpoint\n"),
+		);
+		writeFileSync(
+			join(folder, "0001_afterward.sql"),
+			"CREATE TABLE `afterward` (`id` text PRIMARY KEY NOT NULL);",
+		);
+		return folder;
+	}
 
 	test("recreates a missing table after the watermark was polluted (the real incident)", async () => {
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
 		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(true);
 
-		// Simulate the dirty database: the table and its migration hash are gone, but later
-		// migrations stay applied, and a poisoned row lifts the MAX(created_at) watermark far
-		// past every journal entry — exactly what makes Drizzle's migrate() skip the gap.
-		const removedHash = migrationHashByWhen(sqlite, TOOL_CONTINUATIONS_WHEN);
+		// Simulate the dirty database: the table and its migration hash are gone, and a
+		// poisoned row lifts the MAX(created_at) watermark far past the journal entry —
+		// exactly what makes Drizzle's migrate() skip the gap and leave the table missing.
+		const removedHash = migrationHashByWhen(sqlite, BASELINE_WHEN);
 		expect(removedHash).toBeDefined();
 		sqlite.run("DROP TABLE narrator_tool_continuations");
-		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [TOOL_CONTINUATIONS_WHEN]);
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [BASELINE_WHEN]);
 		sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
 			"forked-branch-marker",
 			9999999999999,
@@ -675,7 +742,7 @@ describe("hash-based migration self-heal", () => {
 		// Re-running migrations must rebuild the missing table and re-stamp its hash.
 		await runMigrations(sqlite);
 		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(true);
-		expect(migrationHashByWhen(sqlite, TOOL_CONTINUATIONS_WHEN)).toBe(removedHash);
+		expect(migrationHashByWhen(sqlite, BASELINE_WHEN)).toBe(removedHash);
 
 		// Column / index / foreign-key shape matches the committed migration.
 		const columns = (
@@ -707,36 +774,31 @@ describe("hash-based migration self-heal", () => {
 		expect(hashCount(sqlite)).toBe(before);
 	});
 
-	test("does NOT re-run a destructive migration whose target table already exists (dirty hole)", async () => {
+	test("does NOT re-run a destructive migration whose target table already exists (dirty hole)", () => {
 		sqlite = new Database(":memory:");
-		await runMigrations(sqlite);
-		sqlite.run("PRAGMA foreign_keys = ON");
-
-		// Seed a benchmark_runs row (the destructive 0028 migration rebuilds this table).
-		sqlite.run("INSERT INTO benchmark_suites (id, name, created_at) VALUES (?, ?, ?)", [
-			"suite-1",
-			"Suite",
-			"now",
-		]);
 		sqlite.run(
-			"INSERT INTO benchmark_runs (id, suite_id, name, model, created_at) VALUES (?, ?, ?, ?, ?)",
-			["run-1", "suite-1", "Run", "model-x", "now"],
+			"CREATE TABLE `benchmark_runs` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL)",
 		);
+		const folder = migrationsFolderWithDestructiveRebuild();
 
-		// Make 0028's hash a "hole": remove it while every later migration stays applied.
-		// benchmark_runs keeps its final structure and its row.
-		const removedHash = migrationHashByWhen(sqlite, BENCHMARK_RUNS_WHEN);
-		expect(removedHash).toBeDefined();
-		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [BENCHMARK_RUNS_WHEN]);
+		// 第一次：两条都应用并盖章，得到“重建早已生效”的库，随后再写入迁移之后才产生的
+		// 活数据——这正是重跑会毁掉的东西。
+		applyPendingMigrationsByHash(sqlite, folder);
+		sqlite.run("INSERT INTO benchmark_runs (id, name) VALUES ('live', 'after-migration')");
 
-		// Re-running must NOT drop/rebuild benchmark_runs (that would delete the row). It only
-		// re-stamps the hash because the table already holds the migration's final shape.
-		await runMigrations(sqlite);
-		expect(
-			(sqlite.prepare("SELECT COUNT(*) AS count FROM benchmark_runs").get() as { count: number })
-				.count,
-		).toBe(1);
-		expect(migrationHashByWhen(sqlite, BENCHMARK_RUNS_WHEN)).toBe(removedHash);
+		// Make the destructive migration's hash a "hole": remove it while the later journal
+		// position stays applied, so the migration sits below the high-water mark.
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [DESTRUCTIVE_WHEN]);
+		const before = hashCount(sqlite);
+
+		// Re-running must NOT drop/rebuild benchmark_runs (that would delete the live row). It
+		// only re-stamps the hash because the table already holds the migration's final shape.
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		expect(sqlite.prepare("SELECT name FROM benchmark_runs WHERE id = 'live'").get()).toEqual({
+			name: "after-migration",
+		});
+		expect(hashCount(sqlite)).toBe(before + 1);
 	});
 
 	test("DOES run a destructive migration on a fresh database (target created earlier in the same run)", async () => {
@@ -883,10 +945,17 @@ describe("destructive migration statement-level error tolerance", () => {
 	});
 });
 
-describe("fast_mode_override backfill (real migration replay)", () => {
-	// folderMillis of 0104_lame_alice, the migration that adds narrators.fast_mode_override.
-	const FAST_MODE_OVERRIDE_WHEN = 1785722772073;
-
+/**
+ * `narrators.fast_mode_override` 的回填有两条互相独立的保护，测试分别钉住它们：
+ *   1. 函数本身——把 legacy 镜像为 ON 的行钉成 `on`，使新默认值（inherit）不会
+ *      静默关掉用户已经在用的快速模式；OFF 的行留在 inherit 去跟随用户默认；
+ *   2. 调用门控——只在列于本次迁移中刚刚出现时执行，否则每次启动都会推翻用户
+ *      后来显式选择的 `inherit`。
+ *
+ * 历史迁移序列已被挤压成单条 `0000_baseline`，无法再“回退到 0104 之前再重放”，
+ * 因此第 1 组直接调用真实回填函数，门控那一组仍走 `runMigrations` 端到端断言。
+ */
+describe("fast_mode_override backfill", () => {
 	function overrideOf(database: Database, narratorId: string): string {
 		return (
 			database
@@ -898,64 +967,83 @@ describe("fast_mode_override backfill (real migration replay)", () => {
 	}
 
 	/**
-	 * A database migrated to just before 0104: every earlier migration applied, the
-	 * new column absent, and legacy narrator rows carrying only the old boolean.
+	 * 真实 schema，加上升级前只带 legacy 布尔值的行：`fast_mode_override` 仍是
+	 * 列默认值 `inherit`，因此 legacy 镜像就是那段行为的唯一痕迹。
 	 */
-	async function databaseBeforeFastModeOverride(): Promise<Database> {
+	async function migratedDatabaseWithLegacyFastModeRows(): Promise<Database> {
 		const database = new Database(":memory:");
 		await runMigrations(database);
-		database.run("ALTER TABLE narrators DROP COLUMN fast_mode_override");
-		database.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [
-			FAST_MODE_OVERRIDE_WHEN,
-		]);
-		for (const [id, fastMode] of [
-			["narrator-fast", 1],
-			["narrator-slow", 0],
+		for (const [id, fastMode, override] of [
+			["narrator-fast", 1, "inherit"],
+			["narrator-slow", 0, "inherit"],
+			["narrator-pinned", 1, "on"],
 		] as const) {
 			database.run(
-				"INSERT INTO narrators (id, fast_mode, created_at, updated_at) VALUES (?, ?, ?, ?)",
-				[id, fastMode, "now", "now"],
+				"INSERT INTO narrators (id, fast_mode, fast_mode_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+				[id, fastMode, override, "now", "now"],
 			);
 		}
 		return database;
 	}
 
 	test("pins narrators that had fast mode ON so the new default cannot silently disable them", async () => {
-		sqlite = await databaseBeforeFastModeOverride();
+		sqlite = await migratedDatabaseWithLegacyFastModeRows();
 
-		await runMigrations(sqlite);
+		backfillFastModeOverride(sqlite);
 
 		expect(overrideOf(sqlite, "narrator-fast")).toBe("on");
 	});
 
 	test("leaves narrators that had fast mode OFF on inherit so they follow the user default", async () => {
-		sqlite = await databaseBeforeFastModeOverride();
+		sqlite = await migratedDatabaseWithLegacyFastModeRows();
 
-		await runMigrations(sqlite);
+		backfillFastModeOverride(sqlite);
 
 		expect(overrideOf(sqlite, "narrator-slow")).toBe("inherit");
 	});
 
+	test("does not rewrite a narrator that is already pinned, so a rerun is harmless", async () => {
+		sqlite = await migratedDatabaseWithLegacyFastModeRows();
+
+		backfillFastModeOverride(sqlite);
+		backfillFastModeOverride(sqlite);
+
+		expect(overrideOf(sqlite, "narrator-pinned")).toBe("on");
+		// 未命中的行也不能被顺手改动。
+		expect(overrideOf(sqlite, "narrator-slow")).toBe("inherit");
+	});
+
 	test("does not re-pin a narrator that later chose inherit while its legacy mirror stayed on", async () => {
-		// The deprecated fast_mode column is only a mirror; once the column exists the
-		// backfill must never run again, or a user's explicit "follow default" choice
-		// would be reverted on every startup.
-		sqlite = await databaseBeforeFastModeOverride();
+		// 列早已存在 => 门控必须跳过回填，否则每次启动都会把用户显式选择的
+		// “跟随默认”重新钉回 on。
+		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
-		sqlite.run("UPDATE narrators SET fast_mode_override = 'inherit', fast_mode = 1 WHERE id = ?", [
-			"narrator-fast",
-		]);
+		sqlite.run(
+			"INSERT INTO narrators (id, fast_mode, fast_mode_override, created_at, updated_at) VALUES (?, 1, 'inherit', ?, ?)",
+			["narrator-fast", "now", "now"],
+		);
 
 		await runMigrations(sqlite);
 
 		expect(overrideOf(sqlite, "narrator-fast")).toBe("inherit");
+
+		// 反证：这一行确实落在回填的命中集合里，所以上面那条断言失败的唯一原因
+		// 只能是门控被移除，而不是这一行本身不匹配条件。
+		backfillFastModeOverride(sqlite);
+		expect(overrideOf(sqlite, "narrator-fast")).toBe("on");
 	});
 });
 
-describe("narrator visibility backfill (real migration replay)", () => {
-	// folderMillis of 0125_salty_iron_fist, the migration that adds narrators.visibility.
-	const NARRATOR_VISIBILITY_WHEN = 1786791964480;
-
+/**
+ * 升级绝不能隐藏团队原本就能看到的工作：pre-ACL 的无主叙述者必须被发布成
+ * `public`，但发布必须恰好发生一次——否则管理员后来说的“改回私有”会在每次启动
+ * 被推翻。两组测试分别钉住这两件事：直接调用真实回填函数断言它的行为，以及走
+ * `runMigrations` 断言“列缺失”门控本身。
+ *
+ * 历史迁移序列已被挤压成单条 `0000_baseline`，无法再重放 0125 之前的 journal
+ * 前缀，因此这里不再回放历史，而是对着真实 schema 检验同一批语义。
+ */
+describe("narrator visibility backfill", () => {
 	function visibilityOf(database: Database, narratorId: string): string {
 		return (
 			database.prepare("SELECT visibility AS v FROM narrators WHERE id = ?").get(narratorId) as {
@@ -965,57 +1053,28 @@ describe("narrator visibility backfill (real migration replay)", () => {
 	}
 
 	/**
-	 * A database migrated to just before 0125: the access-control columns absent and
-	 * legacy narrator rows that nobody owns, exactly as they exist on every install
-	 * that predates narrator ACLs.
+	 * 升级前形态的一行：没有 owner（这正是回填的命中集合），`visibility` 只带列
+	 * 默认值——没有任何人做过可见性决定。
 	 */
-	async function databaseBeforeNarratorVisibility(): Promise<Database> {
-		const database = new Database(":memory:");
-		// Replay the actual prefix, not a latest-schema database with columns removed.
-		// Later table rebuilds add real FKs on owner_user_id; stripping that column
-		// from today's schema is neither valid SQLite nor the pre-ACL upgrade state.
-		const source = new URL("../../drizzle/", import.meta.url);
-		const journal = JSON.parse(readFileSync(new URL("meta/_journal.json", source), "utf8")) as {
-			version: string;
-			dialect: string;
-			entries: Array<{ tag: string; when: number }>;
-		};
-		const targetIndex = journal.entries.findIndex(
-			(entry) => entry.when === NARRATOR_VISIBILITY_WHEN,
-		);
-		expect(targetIndex).toBeGreaterThan(0);
-		const prefix = journal.entries.slice(0, targetIndex);
-		const folder = mkdtempSync(join(tmpdir(), "narrafork-pre-acl-"));
-		try {
-			mkdirSync(join(folder, "meta"));
-			writeFileSync(
-				join(folder, "meta", "_journal.json"),
-				JSON.stringify({ ...journal, entries: prefix }),
-			);
-			for (const entry of prefix) {
-				writeFileSync(
-					join(folder, `${entry.tag}.sql`),
-					readFileSync(new URL(`${entry.tag}.sql`, source)),
-				);
-			}
-			applyPendingMigrationsByHash(database, folder);
-		} finally {
-			rmSync(folder, { recursive: true, force: true });
-		}
+	function insertPreAclNarrator(database: Database, id: string): void {
 		database.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
-			"narrator-legacy",
+			id,
 			"now",
 			"now",
 		]);
-		return database;
 	}
 
 	test("publishes pre-ACL narrators so an upgrade never hides existing work", async () => {
-		sqlite = await databaseBeforeNarratorVisibility();
-
+		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
+		insertPreAclNarrator(sqlite, "narrator-legacy");
+		// 列默认值就是 private——这正是升级会把既有工作藏起来的原因。
+		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("private");
+
+		backfillNarratorVisibility(sqlite);
 
 		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("public");
+		// 日后重新归属 owner 时不能留下悬挂引用：外键必须是 SET NULL。
 		expect(
 			(
 				sqlite.query("PRAGMA foreign_key_list(narrators)").all() as Array<{
@@ -1030,9 +1089,11 @@ describe("narrator visibility backfill (real migration replay)", () => {
 	});
 
 	test("leaves the owner null so only admins can re-home a legacy narrator", async () => {
-		sqlite = await databaseBeforeNarratorVisibility();
-
+		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
+		insertPreAclNarrator(sqlite, "narrator-legacy");
+
+		backfillNarratorVisibility(sqlite);
 
 		const row = sqlite
 			.prepare("SELECT owner_user_id AS owner FROM narrators WHERE id = ?")
@@ -1041,19 +1102,27 @@ describe("narrator visibility backfill (real migration replay)", () => {
 	});
 
 	test("does not re-publish a legacy narrator an admin later made private", async () => {
-		// The whole reason the backfill is gated on the column's prior absence: a
-		// heuristic re-run would keep undoing a deliberate "make this private again".
-		sqlite = await databaseBeforeNarratorVisibility();
+		// 门控存在的全部理由：启发式重跑（例如 `owner IS NULL`）会一直撤销管理员
+		// 刻意做的“重新设为私有”。
+		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
+		insertPreAclNarrator(sqlite, "narrator-legacy");
+		backfillNarratorVisibility(sqlite);
+		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("public");
 		sqlite.run("UPDATE narrators SET visibility = 'private' WHERE id = ?", ["narrator-legacy"]);
 
 		await runMigrations(sqlite);
 
 		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("private");
+
+		// 反证：这一行仍是回填的命中集合（owner 为 null），所以保住 private 的是
+		// 门控本身，而不是这一行不再匹配条件。
+		backfillNarratorVisibility(sqlite);
+		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("public");
 	});
 
 	test("leaves narrators created after the upgrade private by default", async () => {
-		sqlite = await databaseBeforeNarratorVisibility();
+		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
 		sqlite.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
 			"narrator-new",
@@ -1063,6 +1132,7 @@ describe("narrator visibility backfill (real migration replay)", () => {
 
 		await runMigrations(sqlite);
 
+		// 升级之后创建的叙述者默认私有，迁移也绝不能把它们扫进 public。
 		expect(visibilityOf(sqlite, "narrator-new")).toBe("private");
 	});
 });
@@ -1081,12 +1151,11 @@ describe("narrator visibility backfill (real migration replay)", () => {
  *
  * The assertions are phrased against `visibility`, because that is the column the
  * reverted logic keyed on: if anything ever derives write from read again, the `public`
- * and `project` cases below are what fail.
+ * and `project` cases below are what fail. The publishing step is the real
+ * `backfillNarratorVisibility`, so the dangerous read/write combination is genuinely
+ * exercised instead of being described.
  */
-describe("narrator write audience is never widened by migrating (real migration replay)", () => {
-	// folderMillis of 0138_pale_komodo, the migration that adds narrators.write_audience.
-	const WRITE_AUDIENCE_WHEN = 1787393037284;
-
+describe("narrator write audience is never widened by migrating", () => {
 	function writeAudienceOf(database: Database, narratorId: string): string {
 		return (
 			database
@@ -1095,35 +1164,36 @@ describe("narrator write audience is never widened by migrating (real migration 
 		).w;
 	}
 
+	function visibilityOf(database: Database, narratorId: string): string {
+		return (
+			database.prepare("SELECT visibility AS v FROM narrators WHERE id = ?").get(narratorId) as {
+				v: string;
+			}
+		).v;
+	}
+
 	/**
-	 * A database migrated to just before 0138: `write_audience` absent, with one narrator
-	 * per read audience already in place.
-	 *
-	 * `visibility` is set through the same `runMigrations` path production uses, so these
-	 * rows carry legal audiences rather than hand-built states.
+	 * 真实 schema + 一行 pre-ACL 叙述者（无 owner，因此落在发布回填的命中集合里）。
+	 * 历史迁移序列已被挤压成单条基线，无法再重放“0138 即将添加 write_audience”的
+	 * 中间状态，所以改为在已经带上该列的真实库上断言“迁移从不写这一列”。
 	 */
-	async function databaseBeforeWriteAudience(): Promise<Database> {
+	async function migratedDatabaseWithLegacyNarrator(id: string): Promise<Database> {
 		const database = new Database(":memory:");
 		await runMigrations(database);
-		database.run("DROP INDEX IF EXISTS idx_narrators_write_audience");
-		database.run("ALTER TABLE narrators DROP COLUMN write_audience");
-		database.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [WRITE_AUDIENCE_WHEN]);
-		for (const [id, visibility] of [
-			["narrator-public", "public"],
-			["narrator-project", "project"],
-			["narrator-private", "private"],
-		]) {
-			database.run(
-				"INSERT INTO narrators (id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?)",
-				[id, visibility, "now", "now"],
-			);
-		}
+		database.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
+			id,
+			"now",
+			"now",
+		]);
 		return database;
 	}
 
 	test("a publicly READABLE session does not become publicly drivable", async () => {
-		sqlite = await databaseBeforeWriteAudience();
+		sqlite = await migratedDatabaseWithLegacyNarrator("narrator-public");
 
+		// 真实的 pre-ACL 发布：读面确实被放宽到最宽。
+		backfillNarratorVisibility(sqlite);
+		expect(visibilityOf(sqlite, "narrator-public")).toBe("public");
 		await runMigrations(sqlite);
 
 		// The escalation the reverted backfill produced. `public` write combined with
@@ -1133,20 +1203,24 @@ describe("narrator write audience is never widened by migrating (real migration 
 	});
 
 	test("a project-visible session does not become project-drivable", async () => {
-		sqlite = await databaseBeforeWriteAudience();
+		sqlite = await migratedDatabaseWithLegacyNarrator("narrator-project");
+		sqlite.run("UPDATE narrators SET visibility = 'project' WHERE id = ?", ["narrator-project"]);
 
 		await runMigrations(sqlite);
 
+		expect(visibilityOf(sqlite, "narrator-project")).toBe("project");
 		// Narrower than the `public` case but still a widening nobody asked for: project
 		// members who could only watch would gain the ability to run commands.
 		expect(writeAudienceOf(sqlite, "narrator-project")).toBe("owner");
 	});
 
 	test("a private session stays owner-only", async () => {
-		sqlite = await databaseBeforeWriteAudience();
+		sqlite = await migratedDatabaseWithLegacyNarrator("narrator-private");
+		sqlite.run("UPDATE narrators SET visibility = 'private' WHERE id = ?", ["narrator-private"]);
 
 		await runMigrations(sqlite);
 
+		expect(visibilityOf(sqlite, "narrator-private")).toBe("private");
 		expect(writeAudienceOf(sqlite, "narrator-private")).toBe("owner");
 	});
 
@@ -1154,17 +1228,19 @@ describe("narrator write audience is never widened by migrating (real migration 
 		// The other direction: once an owner deliberately opens a session up, replaying
 		// migrations must not pull it back. Nothing should be writing this column during a
 		// migration at all, and this is what would catch a "corrective" one.
-		sqlite = await databaseBeforeWriteAudience();
+		sqlite = await migratedDatabaseWithLegacyNarrator("narrator-widened");
 		await runMigrations(sqlite);
-		sqlite.run("UPDATE narrators SET write_audience = 'public' WHERE id = ?", ["narrator-public"]);
+		sqlite.run("UPDATE narrators SET write_audience = 'public' WHERE id = ?", ["narrator-widened"]);
 
+		// 连真实的发布回填一起跑：它只被允许动读轴。
+		backfillNarratorVisibility(sqlite);
 		await runMigrations(sqlite);
 
-		expect(writeAudienceOf(sqlite, "narrator-public")).toBe("public");
+		expect(writeAudienceOf(sqlite, "narrator-widened")).toBe("public");
 	});
 
 	test("narrators created after the upgrade default to owner-only", async () => {
-		sqlite = await databaseBeforeWriteAudience();
+		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
 		sqlite.run(
 			"INSERT INTO narrators (id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -1405,20 +1481,45 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		"ALTER TABLE `__new_narrators` RENAME TO `narrators`;",
 	];
 
-	test("heals a real 0093 hash hole after 0170 without restoring the retired column", async () => {
+	test("heals a retired-index hash hole after its retirement rebuild without restoring the column", () => {
+		// 这条原本复现“0093 的 hash 空洞出现在 0170 之后”。那两条历史迁移已被挤压成单条
+		// 基线、不再存在于 journal 中，被断言的机制却原样保留：`applyPendingMigrationsByHash`
+		// 会重放处于高水位之下的 hash 空洞，而 `isRetiredIndexCreateError` 依据 journal 里
+		// 后续的退休重建证明该索引已作废，从而跳过它并补上 hash。
+		// 因此改为构造同形状的两条迁移：先建退休索引，再由后续重建把它连同列一起退休。
 		sqlite = new Database(":memory:");
-		await runMigrations(sqlite);
+		// 升级前的 narrators：还带着后来被退休的列。
 		sqlite.run(
-			"INSERT INTO narrators (id,title,created_at,updated_at) VALUES ('kept','preserved','now','now')",
+			"CREATE TABLE narrators (id text PRIMARY KEY, title text, prune_boundary_message_id text)",
 		);
-		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [1785085127123]);
+		sqlite.run("INSERT INTO narrators VALUES ('kept','preserved', NULL)");
+		const folder = migrationsFolderWith("0000_retired_index", [retiredIndexSql], retirementSql);
+
+		// 第一次：索引建立，随后被后续重建退休，两条 hash 都盖章。
+		applyPendingMigrationsByHash(sqlite, folder);
+		expect(columnNames(sqlite, "narrators")).not.toContain("prune_boundary_message_id");
+
+		// 制造真正的 hash 空洞：退休索引所在迁移的 hash 消失，而它之后的 journal 位置仍是
+		// 已应用——这正是源构建升级到发行版后会带上的残缺水位。
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [1_700_000_000_000]);
 		const before = stampedHashes(sqlite);
-		await runMigrations(sqlite);
+		expect(before).toBe(1);
+
+		applyPendingMigrationsByHash(sqlite, folder);
+
+		// 空洞被补上……
 		expect(stampedHashes(sqlite)).toBe(before + 1);
+		// ……数据仍在……
 		expect(sqlite.query("SELECT title FROM narrators WHERE id='kept'").get()).toEqual({
 			title: "preserved",
 		});
+		// ……而且不会把已被退休的列或索引带回来。
 		expect(columnNames(sqlite, "narrators")).not.toContain("prune_boundary_message_id");
+		expect(
+			sqlite
+				.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?")
+				.get("idx_narrators_prune_boundary_message"),
+		).toBeNull();
 	});
 
 	test("skips only the retired index when the journal proves its later retirement", () => {

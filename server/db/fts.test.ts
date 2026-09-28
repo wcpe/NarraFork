@@ -1,19 +1,85 @@
+/**
+ * FTS5 的恢复语义：一次 Drizzle「内容表重建」会重新编号目标表的 rowid，`DROP TABLE` 顺带带走该表上的
+ * 同步触发器，而外内容索引（narrators_fts）仍旧指向旧 rowid。`ensureFts` 必须靠「触发器缺失」这一持久
+ * 信号探测到它并重建索引，且失效前不得重新装回触发器（否则重试信号消失）。
+ *
+ * 本文件原先在**模块顶层**`readFileSync` 读取 `drizzle/0170_green_joshua_kane.sql` 来制造这个前置状态。
+ * 基线挤压后 `drizzle/` 只剩 `0000_baseline.sql`，该文件已不存在，于是整个文件在加载期抛 ENOENT、
+ * 一条测试都不运行（保险丝被无声拔掉）。现在改为两个**真实入口**：
+ *   - fixture 用 `ensureFts` 建库（FTS5 虚拟表与触发器本来就不在 `drizzle/` 里，是运行期建立的）；
+ *   - 重建用 `applyPendingMigrationsByHash` 执行本地构造的**重建形状**迁移，即生产路径上的同一个迁移
+ *     执行器（`sqlite-rebuild-copy.test.ts` 用同样方式驱动同一宿主）。
+ * 断言集合未做任何放宽。
+ */
 import { Database } from "bun:sqlite";
-import { describe, expect, spyOn, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "./fts";
+import { applyPendingMigrationsByHash } from "./run-migrations";
 
-const migration = readFileSync(
-	new URL("../../drizzle/0170_green_joshua_kane.sql", import.meta.url),
-	"utf8",
-);
+const breakpoint = "\n--> statement-breakpoint\n";
+const tempFolders: string[] = [];
 
-/** Use the actual generated destination schema, then restore the retired source columns. */
+afterEach(() => {
+	for (const folder of tempFolders.splice(0)) rmSync(folder, { recursive: true, force: true });
+});
+
+/**
+ * Drizzle 生成的内容表重建形状：建 `__new_narrators` → 按列复制 → `DROP TABLE narrators` → `RENAME`。
+ * 复制列只列源表真实存在的列，所以 0170 之前才有的 prune_* 遗留列在重建后被丢弃——与新表 rowid 从 1
+ * 重新编号一起，构成下面所有断言依赖的前置状态。列表必须与源表列名完全对应，否则迁移执行器会把它当作
+ * 不可识别的映射改写而拒绝执行。
+ */
+const REBUILD_NARRATORS_SQL = [
+	`CREATE TABLE __new_narrators (
+		id text PRIMARY KEY NOT NULL,
+		title text,
+		created_at text,
+		updated_at text,
+		chapter_id text,
+		status text
+	);`,
+	'INSERT INTO __new_narrators("id", "title", "created_at", "updated_at", "chapter_id", "status") SELECT "id", "title", "created_at", "updated_at", "chapter_id", "status" FROM narrators;',
+	"DROP TABLE narrators;",
+	"ALTER TABLE __new_narrators RENAME TO narrators;",
+].join(breakpoint);
+
+/** 走迁移执行器（真实宿主）跑一遍上面的重建，而不是用 sqlite.exec 直接执行裸 SQL。 */
+function rebuildNarrators(sqlite: Database): void {
+	const folder = mkdtempSync(join(tmpdir(), "narrafork-fts-rebuild-"));
+	tempFolders.push(folder);
+	mkdirSync(join(folder, "meta"));
+	writeFileSync(
+		join(folder, "meta", "_journal.json"),
+		JSON.stringify({
+			version: "7",
+			dialect: "sqlite",
+			entries: [
+				{
+					idx: 0,
+					version: "6",
+					when: 1_700_000_000_000,
+					tag: "0170_rebuild_narrators",
+					breakpoints: true,
+				},
+			],
+		}),
+	);
+	writeFileSync(join(folder, "0170_rebuild_narrators.sql"), REBUILD_NARRATORS_SQL);
+	applyPendingMigrationsByHash(sqlite, folder);
+}
+
+/** 用真实入口建 FTS，再用重建前才有的遗留列把表还原成「重建之前」的形状。 */
 function fixture(): Database {
 	const sqlite = new Database(":memory:");
-	const createStart = migration.indexOf("CREATE TABLE");
-	const createEnd = migration.indexOf("--> statement-breakpoint", createStart);
-	sqlite.exec(migration.slice(createStart, createEnd).replaceAll("__new_narrators", "narrators"));
+	// 目标表 DDL 直接取自重建迁移本身，保证 fixture 与被重建的表结构始终一致。
+	const createStart = REBUILD_NARRATORS_SQL.indexOf("CREATE TABLE");
+	const createEnd = REBUILD_NARRATORS_SQL.indexOf(breakpoint, createStart);
+	sqlite.exec(
+		REBUILD_NARRATORS_SQL.slice(createStart, createEnd).replaceAll("__new_narrators", "narrators"),
+	);
 	sqlite.exec(`
 		PRAGMA foreign_keys=OFF;
 		ALTER TABLE narrators ADD COLUMN prune_enabled INTEGER;
@@ -53,13 +119,13 @@ function checkExternalContent(sqlite: Database): void {
 
 describe("FTS recovery after generated content-table migrations", () => {
 	for (const wasClean of [true, false]) {
-		test(`0170 repairs rowid drift on ${wasClean ? "clean" : "unclean"} startup`, () => {
+		test(`a content-table rebuild repairs rowid drift on ${wasClean ? "clean" : "unclean"} startup`, () => {
 			const sqlite = fixture();
 			try {
 				if (wasClean) markCleanShutdown(sqlite);
 				const state = consumeCleanShutdownState(sqlite);
 				expect(state.wasClean).toBe(wasClean);
-				sqlite.exec(migration);
+				rebuildNarrators(sqlite);
 				expect(sqlite.query("SELECT rowid FROM narrators WHERE id='first'").get()).toEqual({
 					rowid: 1,
 				});
@@ -93,7 +159,7 @@ describe("FTS recovery after generated content-table migrations", () => {
 	test("a subsequent healthy clean startup neither probes nor rebuilds content", () => {
 		const sqlite = fixture();
 		try {
-			sqlite.exec(migration);
+			rebuildNarrators(sqlite);
 			ensureFts(sqlite, { wasClean: true });
 			markCleanShutdown(sqlite);
 			const state = consumeCleanShutdownState(sqlite);
@@ -114,7 +180,7 @@ describe("FTS recovery after generated content-table migrations", () => {
 	test("failed repair keeps missing triggers as a retry signal", () => {
 		const sqlite = fixture();
 		try {
-			sqlite.exec(migration);
+			rebuildNarrators(sqlite);
 			const originalRun = sqlite.run.bind(sqlite);
 			const run = spyOn(sqlite, "run").mockImplementation((...args) => {
 				if (String(args[0]).includes("narrators_fts) VALUES ('rebuild')")) {

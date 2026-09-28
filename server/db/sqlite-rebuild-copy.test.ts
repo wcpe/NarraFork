@@ -1,14 +1,25 @@
+/**
+ * Drizzle 的 SQLite 表重建（`CREATE __new_x` → `INSERT … SELECT` → `DROP TABLE x` →
+ * `RENAME __new_x TO x`）在本仓库是由迁移执行器改写的：
+ * `run-migrations.ts` 的 `applyPendingMigrationsByHash`（含 `rewriteQualifiedNewTableChecks`
+ * 剥离 CHECK 里指向 `__new_x` 的表限定名、以及复制列的映射校验）。本文件就是这套改写的
+ * 宿主级测试，绝大多数条目用本地构造的迁移 SQL 驱动它。
+ *
+ * 原本还有两条「回放真实 0153」的条目（连同 0044/0146/0147 一起），但它们读取的历史迁移
+ * 文件已随基线重建消失（现在 `drizzle/` 只剩 `0000_baseline.sql`），不可能复现。它们各自
+ * 独有的断言已改为本地 SQL 驱动同一宿主：重建后外键动作仍然生效 + 同一条迁移不会被重放；
+ * CHECK 限定名被剥离后约束仍然拦得住违规行 + 调用方的 `legacy_alter_table` 被还原。
+ */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPendingMigrationsByHash } from "./run-migrations";
 
 const databases: Database[] = [];
 const tempFolders: string[] = [];
-const migrationsPath = join(import.meta.dir, "../../drizzle");
 const breakpoint = "\n--> statement-breakpoint\n";
 
 afterEach(() => {
@@ -72,113 +83,95 @@ function expectRollback(db: Database, folder: string, error: RegExp): void {
 }
 
 describe("canonical Drizzle rebuild-copy compatibility", () => {
-	test("real 0153 preserves two legacy 13-column attributions, NULLs seven new columns and repairs user deletion", () => {
+	test("a rebuilt table keeps its ON DELETE SET NULL action, NULLs new columns and is never replayed twice", () => {
 		const db = database();
-		// 0.6.6→0.7.2 failed here: Drizzle CHECKs name `__new_file_attributions.lines_added`,
-		// and legacy ALTER TABLE does not rewrite that qualifier on RENAME.
-		db.run("PRAGMA legacy_alter_table = ON");
 		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
-		db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
-		for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
-			db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
-		}
-		db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
-		db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
-		db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
-		db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
-		expect(db.query("PRAGMA table_info(file_attributions)").all()).toHaveLength(13);
-		expect(db.query("PRAGMA foreign_key_list(file_attributions)").all()).toContainEqual(
-			expect.objectContaining({ from: "user_id", on_delete: "NO ACTION" }),
-		);
-
+		db.run(`CREATE TABLE attributions (
+			id text PRIMARY KEY NOT NULL,
+			user_id text,
+			payload text,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE no action ON DELETE set null
+		)`);
 		db.run("INSERT INTO users VALUES ('user-1'), ('user-2')");
-		db.run("INSERT INTO narrators VALUES ('narrator-1'), ('narrator-2')");
-		db.run(`INSERT INTO file_attributions
-			(id, device_id, workspace_path, file_path, narrator_id, user_id, subagent_type,
-			 action, tool_name, tool_use_id, lines_added, lines_removed, changed_at)
-			VALUES
-			('attr-1', 'local', '/work/one', 'src/one.ts', 'narrator-1', 'user-1', 'general',
-			 'edit', 'Edit', 'tool-1', 12, 4, '2026-09-01T10:00:00Z'),
-			('attr-2', 'remote-2', '/work/two', 'src/two.ts', 'narrator-2', 'user-2', NULL,
-			 'write', 'Write', 'tool-2', 0, NULL, '2026-09-02T11:00:00Z')`);
+		db.run(
+			"INSERT INTO attributions VALUES ('attr-1', 'user-1', 'keep-me'), ('attr-2', 'user-2', NULL)",
+		);
 		// Fresh statements across DDL: Bun's query() cache can retain SELECT * result column names.
-		const oldRows = db.prepare("SELECT * FROM file_attributions ORDER BY id").all() as Array<
+		const oldRows = db.prepare("SELECT * FROM attributions ORDER BY id").all() as Array<
 			Record<string, string | number | null>
 		>;
-		const newColumns = {
-			operation_id: null,
-			effect_id: null,
-			scope_id: null,
-			file_key: null,
-			actor_subject_key: null,
-			actor_snapshot_json: null,
-			attribution_grade: null,
-		};
-		const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
-		// Exact committed bytes go only to a temporary fixture; never patch drizzle/ or its journal.
-		const folder = migrationsWith(sql, "0153_tan_bushwacker");
+		const sql = [
+			`CREATE TABLE __new_attributions (
+				id text PRIMARY KEY NOT NULL,
+				user_id text,
+				payload text,
+				lines_added integer,
+				FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE no action ON DELETE set null
+			);`,
+			'INSERT INTO __new_attributions("id", "user_id", "payload") SELECT "id", "user_id", "payload" FROM attributions;',
+			"DROP TABLE attributions;",
+			"ALTER TABLE __new_attributions RENAME TO attributions;",
+		].join(breakpoint);
+		const folder = migrationsWith(sql, "0153_synthetic_attribution_rebuild");
 		applyPendingMigrationsByHash(db, folder);
 
-		expect(db.query("PRAGMA table_info(file_attributions)").all()).toHaveLength(20);
-		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
-			oldRows.map((row) => ({ ...row, ...newColumns })),
+		expect(db.query("PRAGMA table_info(attributions)").all()).toHaveLength(4);
+		expect(db.prepare("SELECT * FROM attributions ORDER BY id").all()).toEqual(
+			oldRows.map((row) => ({ ...row, lines_added: null })),
 		);
 		expect(db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
-		expect(db.query("PRAGMA foreign_key_check(file_attributions)").all()).toEqual([]);
+		expect(db.query("PRAGMA foreign_key_check(attributions)").all()).toEqual([]);
 		expect(db.query("SELECT hash FROM __drizzle_migrations").all()).toEqual([
 			{ hash: createHash("sha256").update(sql).digest("hex") },
 		]);
+		// 第二次应用：hash 已记录 → 必须整体跳过。重建型迁移被重放会 DROP 掉真实数据。
 		applyPendingMigrationsByHash(db, folder);
-		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
-			oldRows.map((row) => ({ ...row, ...newColumns })),
+		expect(db.prepare("SELECT * FROM attributions ORDER BY id").all()).toEqual(
+			oldRows.map((row) => ({ ...row, lines_added: null })),
 		);
+		// 重建最容易打断的就是这条外键动作：删用户必须把归属置空，不能删行也不能报错。
 		db.run("DELETE FROM users WHERE id = 'user-1'");
-		expect(db.query("SELECT id, user_id FROM file_attributions ORDER BY id").all()).toEqual([
+		expect(db.query("SELECT id, user_id FROM attributions ORDER BY id").all()).toEqual([
 			{ id: "attr-1", user_id: null },
 			{ id: "attr-2", user_id: "user-2" },
 		]);
 		db.run("DELETE FROM users WHERE id = 'user-2'");
-		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
-			oldRows.map((row) => ({ ...row, ...newColumns, user_id: null })),
+		expect(db.prepare("SELECT * FROM attributions ORDER BY id").all()).toEqual(
+			oldRows.map((row) => ({ ...row, lines_added: null, user_id: null })),
 		);
 	});
 
-	test("real 0153 renames under legacy_alter_table because CHECK no longer names __new_file_attributions", () => {
+	test("a rebuilt table's CHECK survives the rename, still enforces, and legacy_alter_table is restored", () => {
 		const db = database();
 		db.run("PRAGMA legacy_alter_table = ON");
-		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
-		db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
-		for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
-			db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
-		}
-		db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
-		db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
-		db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
-		db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
-		db.run(`INSERT INTO file_attributions
-			(id, device_id, workspace_path, file_path, narrator_id, user_id, subagent_type,
-			 action, tool_name, tool_use_id, lines_added, lines_removed, changed_at)
-			VALUES
-			('attr-1', 'local', '/work/one', 'src/one.ts', null, null, null,
-			 'edit', 'Edit', 'tool-1', 12, 4, '2026-09-01T10:00:00Z')`);
-		const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
-		applyPendingMigrationsByHash(db, migrationsWith(sql, "0153_tan_bushwacker"));
+		createLegacyX(db);
+		const sql = [
+			`CREATE TABLE __new_x (
+				id text PRIMARY KEY NOT NULL,
+				payload text,
+				added integer,
+				CONSTRAINT ck_own CHECK("__new_x"."added" IS NULL OR "__new_x"."added" >= 0)
+			);`,
+			'INSERT INTO __new_x("id", "payload", "added") SELECT "id", "payload", "added" FROM x;',
+			"DROP TABLE x;",
+			"ALTER TABLE __new_x RENAME TO x;",
+		].join(breakpoint);
+		applyPendingMigrationsByHash(db, migrationsWith(sql));
 
-		const created = db
-			.query("SELECT sql FROM sqlite_master WHERE name = 'file_attributions'")
-			.get() as {
+		const created = db.query("SELECT sql FROM sqlite_master WHERE name = 'x'").get() as {
 			sql: string;
 		};
-		expect(created.sql).not.toContain("__new_file_attributions");
-		expect(created.sql).toContain("ck_file_attr_line_counts");
-		expect(db.query("SELECT id, lines_added, lines_removed FROM file_attributions").all()).toEqual([
-			{ id: "attr-1", lines_added: 12, lines_removed: 4 },
+		expect(created.sql).not.toMatch(/"__new_x"\s*\.\s*"added"/);
+		expect(created.sql).toContain("ck_own");
+		// 约束不能只是文本残留：重命名之后它必须仍然拦得住违规行。
+		expect(() => db.run("INSERT INTO x (id, payload, added) VALUES ('row-bad', 'p', -1)")).toThrow(
+			/ck_own|CHECK constraint/i,
+		);
+		expect(db.query("SELECT id, added FROM x ORDER BY id").all()).toEqual([
+			{ id: "row-1", added: null },
+			{ id: "row-2", added: null },
 		]);
-		expect(() =>
-			db.run(`INSERT INTO file_attributions
-				(id, device_id, workspace_path, file_path, action, changed_at, lines_added)
-				VALUES ('attr-bad', 'local', '/work', 'x.ts', 'edit', '2026-09-01T10:00:00Z', -1)`),
-		).toThrow(/ck_file_attr_line_counts|CHECK constraint/i);
+		// 引擎必须把调用方的 pragma 还原，否则后续迁移的 ALTER TABLE 语义会被悄悄改掉。
 		expect(db.query("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 1 });
 	});
 
@@ -231,7 +224,10 @@ describe("canonical Drizzle rebuild-copy compatibility", () => {
 		};
 		expect(created.sql).not.toMatch(/"__new_x"\s*\.\s*"added"/);
 		expect(created.sql).toContain("ck_own");
-		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([{ id: "row-1" }, { id: "row-2" }]);
+		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([
+			{ id: "row-1" },
+			{ id: "row-2" },
+		]);
 	});
 
 	test("omits new columns so text, numeric and expression defaults apply to every copied row", () => {

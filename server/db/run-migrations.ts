@@ -1637,8 +1637,11 @@ function tableHasColumn(sqlite: Database, table: string, column: string): boolea
  * `fast_mode_override` tri-state defaults to "inherit" (follow the preference),
  * so narrators that had fast mode ON must be pinned to "on" to keep behaving the
  * same. Rows that were OFF stay "inherit" and start following the default.
+ *
+ * 导出仅为测试可见（`run-migrations.test.ts` 直接断言它的行为与幂等性），
+ * 生产调用链不变，仍由 {@link runMigrations} 在列缺失时调用。
  */
-function backfillFastModeOverride(sqlite: Database): void {
+export function backfillFastModeOverride(sqlite: Database): void {
 	try {
 		const result = sqlite
 			.prepare(
@@ -1670,8 +1673,11 @@ function backfillFastModeOverride(sqlite: Database): void {
  * These rows keep `owner_user_id = NULL` on purpose — there is no trustworthy
  * creator to infer. A null owner means only admins can change the sharing
  * settings, and an admin hands one over with `transfer-owner`.
+ *
+ * 导出仅为测试可见（`run-migrations.test.ts` 直接断言它只发布无主行、且不发明
+ * owner），生产调用链不变，仍由 {@link runMigrations} 在列缺失时调用。
  */
-function backfillNarratorVisibility(sqlite: Database): void {
+export function backfillNarratorVisibility(sqlite: Database): void {
 	try {
 		const result = sqlite
 			.prepare("UPDATE narrators SET visibility = 'public' WHERE owner_user_id IS NULL")
@@ -1698,8 +1704,11 @@ function backfillNarratorVisibility(sqlite: Database): void {
  * Gated on the pre-migration absence of `projects.visibility`, exactly like the
  * narrator backfill above, which makes it run at most once — an admin who later
  * makes a project private must not have it flipped back on the next restart.
+ *
+ * 导出仅为测试可见（`__tests__/acl-grant-migration.test.ts` 直接断言它只发布无主项目、
+ * 且不发明 owner），生产调用链不变，仍由 {@link runMigrations} 在列缺失时调用。
  */
-function backfillProjectVisibility(sqlite: Database): void {
+export function backfillProjectVisibility(sqlite: Database): void {
 	try {
 		const result = sqlite
 			.prepare("UPDATE projects SET visibility = 'public' WHERE owner_user_id IS NULL")
@@ -1725,8 +1734,11 @@ function backfillProjectVisibility(sqlite: Database): void {
  * would hide content that was readable a minute earlier, and the symptom — entries
  * simply stop appearing — gives no hint of the cause. Enabling the gate is left as
  * an explicit choice by the collection's owner.
+ *
+ * 导出仅为测试可见（`__tests__/acl-grant-migration.test.ts` 直接断言存量集合被关掉门禁），
+ * 生产调用链不变，仍由 {@link runMigrations} 在列缺失时调用。
  */
-function backfillCollectionProjectGate(sqlite: Database): void {
+export function backfillCollectionProjectGate(sqlite: Database): void {
 	try {
 		const result = sqlite
 			.prepare("UPDATE knowledge_collections SET inherit_project_gate = 0")
@@ -1909,8 +1921,11 @@ function backfillSubagentAclRoot(sqlite: Database): void {
  * an arbitrary grant row, so it becomes its own `write` row. Several source rows
  * carrying canWrite for the same principal and scope collapse onto one row, which
  * the unique index enforces — hence `INSERT OR IGNORE`.
+ *
+ * 导出仅为测试可见（`__tests__/acl-grant-migration.test.ts` 逐条断言映射的越权与锁死语义），
+ * 生产调用链不变，仍由 {@link runMigrations} 在 `acl_grants` 缺席时调用。
  */
-function migrateGrantsToUnifiedAcl(sqlite: Database): void {
+export function migrateGrantsToUnifiedAcl(sqlite: Database): void {
 	try {
 		if (!tableExists(sqlite, "acl_grants")) return;
 

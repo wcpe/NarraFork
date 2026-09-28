@@ -15,15 +15,21 @@
  *  5. **Legacy tables survive**, so a bad migration is a code rollback.
  *  6. Projects come out `public` with no invented owner.
  *
- * Runs the real migration pass against a database rewound to just before the
- * unification migration, same technique as `run-migrations.test.ts`.
+ * 手法说明：这里**不再**把库回退到 0127（统一 ACL）之前再回放历史迁移序列 —— 基线重建后
+ * 那条迁移已不存在，`ALTER TABLE projects DROP COLUMN owner_user_id` 也会被外键定义拒绝
+ * （`error in table projects after drop column`）。断言改为直接指向真实运行时宿主：
+ * `run-migrations.ts` 的 `migrateGrantsToUnifiedAcl` / `backfillProjectVisibility` /
+ * `backfillCollectionProjectGate`（三者按原样导出，生产调用链一字未改）。需要「重启不得
+ * 重放」语义的条目则跑真实的 `runMigrations`，因为那道闸门本就住在它里面。
  */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { runMigrations } from "../run-migrations";
-
-/** folderMillis of 0127_thick_satana, which introduces acl_grants. */
-const UNIFIED_ACL_WHEN = 1786800022207;
+import {
+	backfillCollectionProjectGate,
+	backfillProjectVisibility,
+	migrateGrantsToUnifiedAcl,
+	runMigrations,
+} from "../run-migrations";
 
 let sqlite: Database | undefined;
 
@@ -52,22 +58,31 @@ function aclRows(db: Database, principalId: string): AclRow[] {
 		.all(principalId) as AclRow[];
 }
 
+/** Whole table in a stable order, for "the pass changes nothing" comparisons. */
+function allAclRows(db: Database): AclRow[] {
+	return db
+		.prepare(
+			`SELECT scope_type, scope_id, principal_type, principal_id, capability,
+			        domain_kind, domain_value
+			   FROM acl_grants ORDER BY scope_type, scope_id, principal_id, capability, domain_value`,
+		)
+		.all() as AclRow[];
+}
+
+function countOf(db: Database, table: string): number {
+	return (db.prepare(`SELECT count(*) AS c FROM ${table}`).get() as { c: number }).c;
+}
+
 /**
- * A database migrated to just before 0127: the unified tables and the new columns
- * absent, and legacy grant rows present exactly as a live instance would hold them.
+ * 一棵承载「升级前」授权数据的库：schema 用当前基线全量迁移建好，再把生产实例在升级前
+ * 会持有的那些历史行写进遗留表（`knowledge_grants` / `narrator_grants` 至今仍随基线发布，
+ * 正是为了让这一步可以被真实执行）。
+ *
+ * 这里刻意不写 `acl_grants` 的任何行：它就是 `migrateGrantsToUnifiedAcl` 开工前的状态。
  */
-async function databaseBeforeUnification(): Promise<Database> {
+async function legacyAclDatabase(): Promise<Database> {
 	const db = new Database(":memory:");
 	await runMigrations(db);
-
-	// Rewind the schema to the pre-0127 state.
-	db.run("DROP TABLE IF EXISTS acl_grants");
-	db.run("DROP TABLE IF EXISTS acl_events");
-	db.run("DROP INDEX IF EXISTS idx_projects_owner");
-	db.run("ALTER TABLE projects DROP COLUMN visibility");
-	db.run("ALTER TABLE projects DROP COLUMN owner_user_id");
-	db.run("ALTER TABLE knowledge_collections DROP COLUMN inherit_project_gate");
-	db.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [UNIFIED_ACL_WHEN]);
 
 	const now = "2026-07-19T00:00:00.000Z";
 	db.run("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?,?,?,?,?)", [
@@ -136,9 +151,9 @@ async function databaseBeforeUnification(): Promise<Database> {
 
 describe("knowledge grants → acl_grants", () => {
 	test("a clearance holder does NOT gain a read capability", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
 		const rows = aclRows(sqlite, "u-analyst");
 		const knowledgeRows = rows.filter((r) => r.scope_type !== "narrator");
@@ -151,9 +166,9 @@ describe("knowledge grants → acl_grants", () => {
 	});
 
 	test("a collection-less grant becomes a global-scoped credential", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
 		const row = aclRows(sqlite, "u-analyst").find((r) => r.domain_kind === "clearance");
 		expect(row?.scope_type).toBe("global");
@@ -161,9 +176,9 @@ describe("knowledge grants → acl_grants", () => {
 	});
 
 	test("tag credentials keep their collection scope", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
 		const tags = aclRows(sqlite, "u-editor").filter((r) => r.domain_kind === "tag");
 		expect(tags.map((r) => r.domain_value).sort()).toEqual(["tag-alpha", "tag-beta"]);
@@ -174,9 +189,9 @@ describe("knowledge grants → acl_grants", () => {
 	});
 
 	test("canWrite becomes one write capability, deduplicated across source rows", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
 		const writes = aclRows(sqlite, "u-editor").filter(
 			(r) => r.capability === "write" && r.domain_kind === null && r.scope_id === "c-1",
@@ -188,9 +203,9 @@ describe("knowledge grants → acl_grants", () => {
 
 describe("narrator grants → acl_grants", () => {
 	test("read and write map straight across", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
 		const analystNarrator = aclRows(sqlite, "u-analyst").filter((r) => r.scope_type === "narrator");
 		expect(analystNarrator).toHaveLength(1);
@@ -208,22 +223,23 @@ describe("narrator grants → acl_grants", () => {
 
 describe("migration safety", () => {
 	test("running the pass again changes nothing", async () => {
-		sqlite = await databaseBeforeUnification();
-		await runMigrations(sqlite);
-		const before = sqlite.prepare("SELECT count(*) AS c FROM acl_grants").get() as { c: number };
+		sqlite = await legacyAclDatabase();
+		migrateGrantsToUnifiedAcl(sqlite);
+		const before = allAclRows(sqlite);
+		expect(before.length).toBeGreaterThan(0);
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
-		const after = sqlite.prepare("SELECT count(*) AS c FROM acl_grants").get() as { c: number };
-		expect(after.c).toBe(before.c);
+		// 逐行相等，而不是只比总数：重复行/被冲掉的行都能被发现。
+		expect(allAclRows(sqlite)).toEqual(before);
 	});
 
 	test("a grant revoked after migration is not resurrected on restart", async () => {
-		// The gate is "acl_grants did not exist before this pass", so a later restart
-		// must not re-import from the legacy tables — otherwise revoking access would
-		// be undone by the next reboot.
-		sqlite = await databaseBeforeUnification();
-		await runMigrations(sqlite);
+		// The gate is "acl_grants did not exist before this pass" (see `runMigrations`),
+		// so a later restart must not re-import from the legacy tables — otherwise
+		// revoking access would be undone by the next reboot.
+		sqlite = await legacyAclDatabase();
+		migrateGrantsToUnifiedAcl(sqlite);
 		sqlite.run("DELETE FROM acl_grants WHERE scope_type = 'narrator' AND principal_id = ?", [
 			"u-analyst",
 		]);
@@ -232,29 +248,29 @@ describe("migration safety", () => {
 
 		const rows = aclRows(sqlite, "u-analyst").filter((r) => r.scope_type === "narrator");
 		expect(rows).toHaveLength(0);
+		// 源表仍在（可回滚），所以「没被复活」只可能来自那道闸门，不可能来自源数据消失。
+		expect(countOf(sqlite, "narrator_grants")).toBe(2);
 	});
 
 	test("the legacy tables are left intact for rollback", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
 
-		await runMigrations(sqlite);
+		migrateGrantsToUnifiedAcl(sqlite);
 
-		const knowledge = sqlite.prepare("SELECT count(*) AS c FROM knowledge_grants").get() as {
-			c: number;
-		};
-		const narrator = sqlite.prepare("SELECT count(*) AS c FROM narrator_grants").get() as {
-			c: number;
-		};
-		expect(knowledge.c).toBe(3);
-		expect(narrator.c).toBe(2);
+		expect(countOf(sqlite, "knowledge_grants")).toBe(3);
+		expect(countOf(sqlite, "narrator_grants")).toBe(2);
 	});
 });
 
 describe("project visibility backfill", () => {
 	test("existing projects become public with no invented owner", async () => {
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
+		// 新行的默认值是 private，所以下面那条 UPDATE 必须真的生效才算数。
+		expect(sqlite.prepare("SELECT visibility FROM projects WHERE id = ?").get("p-1")).toEqual({
+			visibility: "private",
+		});
 
-		await runMigrations(sqlite);
+		backfillProjectVisibility(sqlite);
 
 		const row = sqlite
 			.prepare("SELECT visibility, owner_user_id FROM projects WHERE id = ?")
@@ -264,8 +280,12 @@ describe("project visibility backfill", () => {
 	});
 
 	test("a project made private afterwards stays private across restarts", async () => {
-		sqlite = await databaseBeforeUnification();
-		await runMigrations(sqlite);
+		sqlite = await legacyAclDatabase();
+		backfillProjectVisibility(sqlite);
+		// 前提：无主（否则下面的回填根本不会碰这一行，测试就会因错误的原因变绿）。
+		expect(sqlite.prepare("SELECT owner_user_id FROM projects WHERE id = ?").get("p-1")).toEqual({
+			owner_user_id: null,
+		});
 		sqlite.run("UPDATE projects SET visibility = 'private' WHERE id = ?", ["p-1"]);
 
 		await runMigrations(sqlite);
@@ -279,9 +299,14 @@ describe("project visibility backfill", () => {
 	test("collections created before project ACLs do not inherit the project gate", async () => {
 		// The column defaults to true for new rows, but existing collections must come
 		// out false or a migration would silently hide readable content.
-		sqlite = await databaseBeforeUnification();
+		sqlite = await legacyAclDatabase();
+		expect(
+			sqlite
+				.prepare("SELECT inherit_project_gate AS g FROM knowledge_collections WHERE id = ?")
+				.get("c-1"),
+		).toEqual({ g: 1 });
 
-		await runMigrations(sqlite);
+		backfillCollectionProjectGate(sqlite);
 
 		const row = sqlite
 			.prepare("SELECT inherit_project_gate AS g FROM knowledge_collections WHERE id = ?")
