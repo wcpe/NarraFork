@@ -52,6 +52,11 @@ const DIST_DIR = join(ROOT, "dist");
 const args = process.argv.slice(2);
 const skipFrontend = args.includes("--skip-frontend");
 const platformArg = args.find((a) => a.startsWith("--platform="))?.split("=")[1];
+/**
+ * 可选的本地目标平台运行时路径，用于受限网络下绕过 bun 的 GitHub 下载。
+ * 该二进制必须与当前运行中的 Bun 同版本（见下方 --compile-executable-path 处的说明）。
+ */
+const compileExecutablePath = process.env.NF_COMPILE_EXECUTABLE_PATH?.trim() || undefined;
 
 // Available platforms
 // NOTE: platformId must match the format returned by getPlatform() in update-service.ts
@@ -388,6 +393,15 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"--minify",
 			"--target",
 			platform.target,
+			// 跨平台编译需要一个"目标平台的 Bun 运行时"。默认由 bun 自行从 GitHub Releases 下载，
+			// 但在受限网络（企业代理/防火墙/离线机器）下那条通道常被重置，构建会以
+			// `Failed to extract executable for 'bun-<target>-v<版本>'` 失败。
+			// 设置 NF_COMPILE_EXECUTABLE_PATH 指向本地已有的目标平台二进制即可绕过下载。
+			// 该二进制必须与当前 Bun 同版本——版本不一致正是协议清单校验要拦的事
+			// （bun 内嵌 JavaScriptCore，不同版本的静态链接清单可能不同）。
+			...(compileExecutablePath
+				? ["--compile-executable-path", compileExecutablePath]
+				: []),
 			"--asset-naming=[dir]/[name].[ext]",
 			// electron is referenced by puppeteer-core but never used in headless mode
 			"--external=electron",
