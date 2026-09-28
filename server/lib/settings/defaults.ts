@@ -75,6 +75,11 @@ export const DEFAULTS: NarraForkSettings = {
 			review: [],
 		},
 		subagentModelReasoningEfforts: {},
+		// 默认关闭：没有 profiles 就没有可用方案，编排不会介入任何派发
+		orchestration: {
+			orchestratorModels: [],
+			profiles: [],
+		},
 		legacyEncoding: false,
 		freshShellEnv: false,
 		requestDumpEnabled: false,
@@ -551,6 +556,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "object",
 		valid:
 			"explore/plan/search/review/general；每类最多 50 项；模型引用最长 200；等级 none/low/medium/high/xhigh/max；默认 {}",
+	},
+	"agent.orchestration": {
+		desc: "编排模式允许为「编制者」和四个干活档位（杂活/快速/中等/主力）分别绑定模型池；每个池条目可设请求优先级与并发上限，并发时会按容量把负载铺匀；空 profiles 表示功能关闭。",
+		type: "object",
 	},
 	"agent.legacyEncoding": {
 		desc: "启用非 UTF-8 编码检测（GBK、Shift_JIS 等）。启用后文件读写使用 chardet 自动检测并保留原始编码。禁用时仅使用 UTF-8。",

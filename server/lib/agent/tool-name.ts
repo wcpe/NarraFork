@@ -43,6 +43,16 @@ export const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 export const BASH_TOOL_NAME = "Bash";
 
 /**
+ * The orchestrated-session shared-fact tool.
+ *
+ * Declared in this leaf module rather than next to the tool implementation because the
+ * tool sets in `services/agent-runtime/policy.ts` need the name, and that module must
+ * not import a tool file (the tool files reach back into `agent/types.ts`, which
+ * references the policy type — the same shape of cycle `BASH_TOOL_NAME` avoids).
+ */
+export const SESSION_FACT_TOOL_NAME = "SessionFact";
+
+/**
  * Names that used to be minted for the shell tool. Stored history from older
  * Windows installs still carries them, and a model that read such history may
  * echo the old name, so they resolve to `Bash` instead of failing.

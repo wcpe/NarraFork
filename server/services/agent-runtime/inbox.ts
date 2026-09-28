@@ -393,6 +393,37 @@ export async function hasInboxKind(narratorId: string, kinds: MailboxKind[]): Pr
 export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boolean> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
+
+/**
+ * 唤醒会**消费**的 mailbox 种类——"队列里还有没有别人等着要做的事"的权威清单。
+ *
+ * 它回答的不是"唤醒在乎哪些种类"，而是"队列里出现哪些种类就说明还有活要做"：
+ * `user_input` 是用户直接说的话，`agent_message` 是别的叙述者 Send 进来的消息，
+ * 两者都会被唤醒后那一轮读走。`task_notice` 不在这里——通知分可行动与纯播报两种，
+ * 只有可行动的那些算（见 {@link hasActionableTaskNotice}）。
+ *
+ * **停放侧（编排 worker 的归档）问的必须是同一个问题**：归档后
+ * `wakeInboxIfEligible` 直接返回 false、Send 也会被拒（"Target subagent is
+ * archived"），所以任何"唤醒会消费、但判断时被漏掉"的消息都再也无人消费，
+ * 而发送方被告知的是"已排队"。之前那个缺陷正是这样：这里（唤醒）算上了
+ * `agent_message`，而停放侧只查 `user_input`。
+ *
+ * 因此这份清单**全仓只有这一份**，改动它时要一并确认两侧的语义
+ * （`hasWakeableInboxWork` 的调用方：`wakeInboxIfEligible` 与
+ * `parkCompletedOrchestrationWorker`）。
+ */
+export const WAKEABLE_INBOX_KINDS: readonly MailboxKind[] = ["user_input", "agent_message"];
+
+/**
+ * 队列里还有没有**可行动的**任务通知。
+ *
+ * 只认 `started` / `cancelled` 之外的 `eventKind`：那两个是"开始跑了"和"取消了"的
+ * 播报，没有可执行的内容，为它们唤醒一轮只会烧一次模型调用。判定按方言分开构造
+ * （SQLite 用 `json_extract`，PG 走 `jsonb` 提取），刻意不共用一条 SQL。
+ */
+export async function hasActionableTaskNotice(narratorId: string): Promise<boolean> {
+	const port = getRuntimeQueuePort();
+	if (port) return port.mailbox.hasActionableTaskNotice(narratorId);
 	return !!db
 		.select({ id: mailbox.id })
 		.from(mailbox)
@@ -400,11 +431,26 @@ export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boo
 			and(
 				eq(mailbox.narratorId, narratorId),
 				eq(mailbox.state, "queued"),
-				sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
+				eq(mailbox.kind, "task_notice"),
+				sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
 			),
 		)
 		.limit(1)
 		.get();
+}
+
+/**
+ * 队列里是否还有**唤醒会消费**的东西——"还有什么在排队"这个问题在全仓唯一的答案。
+ *
+ * 两个调用方必须问同一个问题，且必须都走这个函数而不能各自拼查询：
+ *  - `wakeInboxIfEligible`：决定要不要把一个闲着的叙述者叫起来；
+ *  - `parkCompletedOrchestrationWorker`：决定这个 worker 能不能被归档。
+ * 归档会让上一条路彻底失效（归档状态直接 return false，Send 也会被拒），
+ * 所以"唤醒算得上、停放没算上"的差异就是一条消息被永久搁浅。
+ */
+export async function hasWakeableInboxWork(narratorId: string): Promise<boolean> {
+	if (await hasInboxKind(narratorId, [...WAKEABLE_INBOX_KINDS])) return true;
+	return await hasActionableTaskNotice(narratorId);
 }
 /**
  * The eligible-head projection the claim predicate sees, widened to the dialect-neutral
@@ -1111,9 +1157,7 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 				isNarratorRevertAdmissionBlocked(narratorId)
 			)
 				return false;
-			// Named backend reads on PostgreSQL; SQLite keeps its own store. The task-notice
-			// probe is dialect-specific by construction (json_extract vs jsonb extraction) and
-			// lives behind `hasActionableTaskNotice` on the PG side — never a shared fallback.
+			// Named backend reads on PostgreSQL; SQLite keeps its own store.
 			const port = getRuntimeQueuePort();
 			const row = port
 				? await port.mailbox.readRecipientRoute(narratorId)
@@ -1160,24 +1204,9 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 					)
 				).started;
 			}
-			if (!(await hasWakeEligibleInboxInput(narratorId))) {
-				const notice = port
-					? await port.mailbox.hasActionableTaskNotice(narratorId)
-					: !!db
-							.select({ id: mailbox.id })
-							.from(mailbox)
-							.where(
-								and(
-									eq(mailbox.narratorId, narratorId),
-									eq(mailbox.state, "queued"),
-									eq(mailbox.kind, "task_notice"),
-									sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
-								),
-							)
-							.limit(1)
-							.get();
-				if (!notice) return false;
-			}
+			// 与停放判定共用同一个谓词：这个分支漏掉哪一种 kind，那种消息就会在
+			// worker 被归档之后永久搁浅（停放侧读的是同一个函数）。
+			if (!(await hasWakeableInboxWork(narratorId))) return false;
 			if (row.variant.startsWith("subagent:")) {
 				// A taken-over subagent with no live runner (e.g. a background takeover parked
 				// idle) is woken only for its OWN queued work — user input or a Send to it; the

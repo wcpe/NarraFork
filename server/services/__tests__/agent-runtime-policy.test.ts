@@ -165,6 +165,46 @@ describe("shared capability projections", () => {
 		expect(Object.isFrozen(policy.tools.builtin)).toBe(true);
 	});
 
+	// 回归：`toolAccess: "custom"` 曾无条件把 readOnly 写成 false、MCP 写成 "nonDenied"，
+	// 于是"候选全是只读工具"这种配置被描述成可写，MCP 白名单也挡不住可写的 MCP 工具。
+	// 现在按工具集的**实际内容**推导，这条断言就是为了防止它被改回声明式判定。
+	test("a custom tool set made only of read tools stays read-only", () => {
+		const policy = resolveRuntimePolicy({
+			variant: "subagent",
+			subagentType: "custom",
+			customDefinition: { toolAccess: "custom", customTools: ["Read", "Grep", "mcp__test__read"] },
+		});
+		expect(policy.tools.readOnly).toBe(true);
+		expect(policy.tools.mcp).toBe("readOnly");
+		expect(isRuntimeToolAllowed(policy, "Read")).toBe(true);
+		expect(isRuntimeToolAllowed(policy, "mcp__test__read", "readOnly")).toBe(true);
+		// 只读语义下即使工具名在白名单里，可写的 MCP 行为也必须被挡住
+		expect(isRuntimeToolAllowed(policy, "mcp__test__read", "readWrite")).toBe(false);
+	});
+
+	test("a custom tool set containing a write tool is not read-only", () => {
+		const policy = resolveRuntimePolicy({
+			variant: "subagent",
+			subagentType: "custom",
+			customDefinition: { toolAccess: "custom", customTools: ["Read", "Write"] },
+		});
+		expect(policy.tools.readOnly).toBe(false);
+		expect(policy.tools.mcp).toBe("nonDenied");
+		expect(isRuntimeToolAllowed(policy, "Write")).toBe(true);
+	});
+
+	test("an empty custom tool set is not described as read-only", () => {
+		const policy = resolveRuntimePolicy({
+			variant: "subagent",
+			subagentType: "custom",
+			customDefinition: { toolAccess: "custom", customTools: [] },
+		});
+		// 空集是"没有任何工具"的退化配置，不是"只读"——两者都不该被误报成可写
+		expect(policy.tools.readOnly).toBe(false);
+		expect(isRuntimeToolAllowed(policy, "Read")).toBe(false);
+		expect(isRuntimeToolAllowed(policy, "Write")).toBe(false);
+	});
+
 	test("direct tool execution rejects legacy synchronous child inputs before service work or wait registration", async () => {
 		const ctx = {
 			narratorId: "child",

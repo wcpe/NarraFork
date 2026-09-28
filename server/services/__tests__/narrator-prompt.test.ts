@@ -390,3 +390,141 @@ describe("narrator prompt shell tool naming", () => {
 		expect(prompt).toContain("File and command tools (Read, Write, Edit, Glob, Grep, Bash)");
 	});
 });
+
+/**
+ * 编制者模式下，提示词不得点名它拿不到的工具。
+ *
+ * 编制者的工具面里没有 `Bash` / `Glob` / `Grep`，`Write` / `Edit` 也只对 `spec://`
+ * 生效（见 orchestrator-spec-write-guard.ts）。`cwd` 段、`Execution Devices` 段与
+ * Dynamic Spec 提醒却都会逐轮注入，若继续按"用 Write/Edit/Grep 操作文件"的口气写，
+ * 就是在教它走一条它做不到的路径——白烧推理直到 stall 保护兜住。
+ *
+ * 三段都按片段切出来断言，而不是对整份提示词断言：项目指令（仓库自带的 AGENTS.md /
+ * CLAUDE.md 就大量提到 Bash、Write、Edit、Grep）与全局指令不属于这三段，
+ * 把它们算进来只会得到一条永远红的假设。
+ */
+describe("orchestrator mode prompt consistency", () => {
+	const FORBIDDEN_TOOL_NAMES = ["Bash", "Write", "Edit", "Glob", "Grep"];
+
+	/** 从 start 标记切到 end 标记，切不到就抛错（避免"切空了所以断言通过"）。 */
+	function sliceSection(prompt: string | null, start: string, end: string): string {
+		const text = prompt ?? "";
+		const from = text.indexOf(start);
+		if (from < 0) throw new Error(`missing section start: ${start}`);
+		const to = text.indexOf(end, from + start.length);
+		if (to < 0) throw new Error(`missing section end: ${end}`);
+		return text.slice(from, to);
+	}
+
+	function cwdSection(prompt: string | null): string {
+		return sliceSection(prompt, "## Current Working Directory", "\n## ");
+	}
+
+	function deviceSection(prompt: string | null): string {
+		return sliceSection(prompt, "## Execution Devices", "<system-reminder>");
+	}
+
+	function dynamicSpecSection(prompt: string | null): string {
+		return sliceSection(prompt, "# Dynamic Spec", "</system-reminder>");
+	}
+
+	const remoteDevices = [{ id: "dev-1", name: "Remote One", online: true }];
+
+	test("en: 编制者的三段都不点名它拿不到的工具，且仍然交代任务队列", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-orchestrator-prompt-en-${Date.now()}`,
+			locale: "en",
+			replyInUserLanguage: false,
+			devices: remoteDevices,
+			orchestratorMode: true,
+		});
+
+		for (const section of [cwdSection(prompt), deviceSection(prompt), dynamicSpecSection(prompt)]) {
+			for (const name of FORBIDDEN_TOOL_NAMES) {
+				expect(section).not.toContain(name);
+			}
+		}
+		// 换掉的是工具名，不是职责本身：任务队列仍然要求它维护
+		expect(dynamicSpecSection(prompt)).toContain("spec://tasks.json");
+		expect(dynamicSpecSection(prompt)).toContain(
+			"Allowed statuses: `todo`, `doing`, `done`, `blocked`",
+		);
+	});
+
+	test("zh-CN: 编制者的三段同样不点名", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-orchestrator-prompt-zh-${Date.now()}`,
+			locale: "zh-CN",
+			replyInUserLanguage: false,
+			devices: remoteDevices,
+			orchestratorMode: true,
+		});
+
+		for (const section of [cwdSection(prompt), deviceSection(prompt), dynamicSpecSection(prompt)]) {
+			for (const name of FORBIDDEN_TOOL_NAMES) {
+				expect(section).not.toContain(name);
+			}
+		}
+		expect(dynamicSpecSection(prompt)).toContain("spec://tasks.json");
+	});
+
+	test("非编制者模式：三段与改动前逐字相同", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-non-orchestrator-prompt-${Date.now()}`,
+			locale: "en",
+			replyInUserLanguage: false,
+			devices: remoteDevices,
+		});
+
+		// cwd 段：原文原句（与上面的既有守卫同一句，这里再确认它没有被编排分支改写）
+		expect(prompt).toContain(
+			"All tools (Bash, Read, Write, Edit, Glob, Grep) already use this as their default working directory. " +
+				"Do NOT `cd` into it in Bash commands — it is redundant.",
+		);
+		// Execution Devices 段：原文原句
+		expect(prompt).toContain("File and command tools (Read, Write, Edit, Glob, Grep, Bash) ");
+		expect(prompt).toContain(
+			"To change the default target for subsequent tools, use the SwitchDevice tool.",
+		);
+		expect(prompt).toContain(
+			"- Paths and commands are interpreted on the selected target's filesystem.",
+		);
+		// Dynamic Spec 提醒：三条点名工具的句子逐字保留
+		const spec = dynamicSpecSection(prompt);
+		expect(spec).toContain(
+			"Use `Read`, `Write`, `Edit`, and `Grep` directly with `spec://...` URIs:",
+		);
+		expect(spec).toContain('- Use `Grep` with `path: "spec://"` to search Dynamic Spec files.');
+		expect(spec).toContain("Do not use Bash or Glob for `spec://` virtual files.");
+		// 省略 orchestratorMode 与显式传 false 必须是同一份文本
+		expect(getDynamicSpecSystemReminder("en")).toBe(
+			getDynamicSpecSystemReminder("en", { orchestrator: false }),
+		);
+		expect(getDynamicSpecSystemReminder("zh-CN")).toContain(
+			"直接用 `Read`、`Write`、`Edit`、`Grep` 访问 `spec://...` URI：",
+		);
+		expect(getDynamicSpecSystemReminder("zh-CN")).toContain(
+			"不要用 Bash 或 Glob 访问 `spec://` 虚拟文件。",
+		);
+	});
+
+	test("编制者模式下仍然保留 Dynamic Spec 的其余规则（protected / 有限任务 / blocked）", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-orchestrator-rules-${Date.now()}`,
+			locale: "en",
+			replyInUserLanguage: false,
+			devices: remoteDevices,
+			orchestratorMode: true,
+		});
+		const spec = dynamicSpecSection(prompt);
+		expect(spec).toContain("may trigger auto-continuation while it stays open");
+		expect(spec).toContain("Every open task must be finite, executable");
+		expect(spec).toContain("Standing behavior rules, prohibitions, and guardrails");
+		expect(spec).toContain("add a concrete actionable unblock task");
+		expect(spec).toContain("spec://behavior_fence");
+	});
+});

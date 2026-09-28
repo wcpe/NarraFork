@@ -11,6 +11,7 @@ import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { decodeFileBytes } from "./encoding";
 import { looseNumber, normalizeNumber } from "./number-param";
+import { orchestratorSpecOnlyReadRejection } from "./orchestrator-spec-write-guard";
 
 /**
  * When limit = -1 (read-all mode), cap output at ≈100 KB of text
@@ -137,6 +138,13 @@ export const readTool: ToolDefinition = {
 			offset?: number;
 			limit?: number;
 		};
+
+		// 编排编制者只读 Dynamic Spec：它当初拿到 Read 是为了看自己的任务清单，
+		// 但 Read 是通用工具，实测被用来翻源码，于是"编制者不干活"那条设计失效。
+		// 守卫放在这里（任何本地读取之前），与 Write/Edit 共用同一套判定，
+		// 见 orchestrator-spec-write-guard.ts 的模块说明。
+		const orchestratorRejection = orchestratorSpecOnlyReadRejection(ctx, file_path);
+		if (orchestratorRejection) return orchestratorRejection;
 
 		// Coerce offset/limit to integers and clamp to sane values so that
 		// slightly-off model outputs (floats, string-encoded numbers, 0, negative)

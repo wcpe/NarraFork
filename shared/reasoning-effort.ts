@@ -30,6 +30,20 @@ export const REASONING_EFFORT_VALUES: readonly ReasoningEffort[] = [
 ];
 
 /**
+ * 窄化守卫：值是否为合法思考等级。
+ *
+ * 放在这里（而不是各消费方各写一份）是刻意的：这是一份**跨前后端、跨四套配置**
+ * 共用的口径——子代理按类型配的强度、编排池条目内联的强度、编排编制者内联的强度
+ * 都要用同一张表判断。各写一份的后果不是编译错误，而是某一处悄悄多认/少认一个值
+ * （例如 `"xhigh"` 只在半数地方被接受），表现为"同样的配置在一处生效、在另一处被丢弃"。
+ */
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+	return (
+		typeof value === "string" && (REASONING_EFFORT_VALUES as readonly string[]).includes(value)
+	);
+}
+
+/**
  * Clamp a desired reasoning effort onto the tiers a model actually supports.
  *
  * Rules:

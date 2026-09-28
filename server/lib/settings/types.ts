@@ -10,6 +10,8 @@ import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { DiskSafetySettings } from "../disk-safety-config";
 import type { ModelCatalogSettings } from "../model-catalog";
+// orchestration/types 不反向 import settings，因此这里只引入类型不会形成循环依赖
+import type { OrchestrationSettings } from "../orchestration/types";
 import type { PermissionMode } from "../permission-modes";
 import type { UserAgentMode } from "../user-agent";
 
@@ -649,6 +651,11 @@ export interface NarraForkSettings {
 		};
 		/** Optional fixed tiers for entries in the corresponding allowed model pool. */
 		subagentModelReasoningEfforts?: SubagentModelReasoningEfforts;
+		/**
+		 * 编排模式：为「编制者」与四个干活档位（chore/quick/medium/heavy）
+		 * 分别绑定模型池。空 profiles 表示功能关闭。
+		 */
+		orchestration?: OrchestrationSettings;
 		/**
 		 * Enable non-UTF-8 charset detection (GBK, Shift_JIS, …) for file read/write
 		 * and grep. Note: shell command output is auto-detected on Windows regardless

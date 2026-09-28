@@ -37,6 +37,7 @@ import { requestPermissionRuleTool } from "./request-permission-rule";
 import { scheduledTaskTool } from "./scheduled-task";
 import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
+import { sessionFactTool } from "./session-fact";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
 import { structSedTool } from "./struct-sed";
@@ -83,6 +84,10 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["KnowledgeReview", knowledgeReviewTool],
 	["StartPipeline", startPipelineTool],
 	["ExtractPipeline", extractPipelineTool],
+	// 共享事实只在编排派发里可用，但它的**可见性**走的是档位工具集（见 policy.ts 的
+	// READ_TOOLS）。放进可选工具是为了让普通主叙述者的工具列表保持原样：子代理会绕过
+	// 可选工具的装载闸门，编排 worker 因此不需要任何额外的激活步骤。
+	["SessionFact", sessionFactTool],
 ]);
 
 /**

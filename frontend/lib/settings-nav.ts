@@ -7,6 +7,7 @@ import {
 	IconCpu,
 	IconDatabase,
 	IconDeviceLaptop,
+	IconHierarchy,
 	IconHistory,
 	IconInfoCircle,
 	IconKey,
@@ -73,6 +74,8 @@ export const ADMIN_PATHS: ReadonlySet<string> = new Set([
 	// Models and agent defaults are instance-wide (PATCH /api/settings), not per-user.
 	"/settings/models",
 	"/settings/agent",
+	// Orchestration pools and profiles are instance-wide (PATCH /api/settings) too.
+	"/settings/orchestration",
 	"/settings/authentication",
 	"/settings/oauth-apps",
 	"/settings/users",
@@ -128,6 +131,7 @@ const instanceItems: readonly SettingsNavItem[] = [
 	{ to: "/settings/providers", labelKey: "providersSection", Icon: IconCloud },
 	{ to: "/settings/models", labelKey: "modelsSection", Icon: IconCpu },
 	{ to: "/settings/agent", labelKey: "agentSection", Icon: IconBrain },
+	{ to: "/settings/orchestration", labelKey: "orchestrationSection", Icon: IconHierarchy },
 	{ to: "/settings/search", labelKey: "searchSection", Icon: IconSearch },
 	{ to: "/settings/proxy", labelKey: "proxyManagementSection", Icon: IconShield },
 	{ to: "/settings/chapters", labelKey: "chaptersAndContainersSection", Icon: IconBox },

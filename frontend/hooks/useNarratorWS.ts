@@ -5,6 +5,7 @@ import {
 	type SubagentModelInheritance,
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { OrchestrationLiveObservation } from "@shared/orchestration-live";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -674,6 +675,7 @@ export interface NarratorWSCallbacks {
 		compactStart?: number,
 		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
+	onOrchestrationObservation?: (observation: OrchestrationLiveObservation) => void;
 	onGitStatus?: (data: {
 		/** Null for chapter-less narrators; workspace-keyed queries still apply. */
 		chapterId: string | null;
@@ -833,6 +835,22 @@ export interface NarratorWSCallbacks {
 			maxRetries?: number;
 			delayMs?: number;
 		},
+	) => void;
+	/**
+	 * 一个子代理被停在了自恢复的阻塞上：NUG 凭据池不可用，或额度窗口未重置。
+	 *
+	 * 与父叙述者那条 `onModelUnavailableWaiting` 是同一件事，只是作用对象是子代理行
+	 * ——父叙述者的等待态从来不会让子代理的卡片说清"它为什么不动了"，而这两个帧
+	 * 才是那张卡片唯一的信号来源。
+	 */
+	onSubagentModelUnavailableWaiting?: (
+		subagentNarratorId: string,
+		info: { model: string; waitKind?: "credentials" | "quota"; resumeAt?: number },
+	) => void;
+	/** 上述阻塞已解除，子代理正在继续。 */
+	onSubagentModelUnavailableRecovered?: (
+		subagentNarratorId: string,
+		info: { model: string; waitKind?: "credentials" | "quota" },
 	) => void;
 	onSubagentConclusionUpdated?: (
 		subagentNarratorId: string,
@@ -1050,6 +1068,13 @@ export function useNarratorWS(
 						break;
 					case "stream_event":
 						callbackOwner.callbacks.onStreamEvent?.(data);
+						break;
+					case "orchestration_observation":
+						if (data.observation && typeof data.observation === "object") {
+							callbackOwner.callbacks.onOrchestrationObservation?.(
+								data.observation as OrchestrationLiveObservation,
+							);
+						}
 						break;
 					case "permission_request":
 						if (data.request) {
@@ -1723,6 +1748,28 @@ export function useNarratorWS(
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
 						});
+						break;
+					// 子代理停在「模型不可用」的等待上 / 该等待已解除。这两个帧此前被
+					// 静默丢弃，因此父级面板只知道子代理"在跑"，说不出它为什么不动；
+					// 它们也是模型 badge 变成"换模型继续"入口的唯一来源。
+					case "subagent_model_unavailable_waiting":
+						callbackOwner.callbacks.onSubagentModelUnavailableWaiting?.(
+							data.subagentNarratorId as string,
+							{
+								model: data.model as string,
+								...(data.waitKind ? { waitKind: data.waitKind as "credentials" | "quota" } : {}),
+								...(typeof data.resumeAt === "number" ? { resumeAt: data.resumeAt } : {}),
+							},
+						);
+						break;
+					case "subagent_model_unavailable_recovered":
+						callbackOwner.callbacks.onSubagentModelUnavailableRecovered?.(
+							data.subagentNarratorId as string,
+							{
+								model: data.model as string,
+								...(data.waitKind ? { waitKind: data.waitKind as "credentials" | "quota" } : {}),
+							},
+						);
 						break;
 					case "subagent_conclusion_updated":
 						callbackOwner.callbacks.onSubagentConclusionUpdated?.(

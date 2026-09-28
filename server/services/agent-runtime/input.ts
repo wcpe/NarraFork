@@ -1,3 +1,4 @@
+import type { OrchestrationLiveIdentity } from "@shared/orchestration-live";
 import type { ImageRef } from "../../lib/uploads";
 import type { CustomSubagentDef } from "../custom-subagent-service";
 import type { ExecuteLoopResult } from "../narrator-executor";
@@ -21,6 +22,8 @@ export interface SubagentRuntimeProfile {
 	parentNarratorId: string;
 	parentToolUseId: string;
 	subagentType: string;
+	/** 当前编排 worker/reviewer 的实时身份。 */
+	orchestration?: OrchestrationLiveIdentity;
 	customDefinition?: CustomSubagentDef | null;
 	systemPrompt: string;
 	initialModel?: string;

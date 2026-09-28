@@ -65,6 +65,7 @@ import {
 	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
+import { orchestrationSettingsSchema } from "../lib/validators/orchestration";
 import {
 	defaultNarratorVisibilitySchema,
 	defaultNarratorWriteAudienceSchema,
@@ -516,10 +517,12 @@ export const updateSettingsSchema = z
 						}),
 					})
 					.optional(),
-				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
-				queueDuringCompaction: z.boolean().optional(),
-				browserProxy: proxyOverrideSchema,
-				notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),
+			autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
+			queueDuringCompaction: z.boolean().optional(),
+			browserProxy: proxyOverrideSchema,
+			notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),
+			// 编排模式：编制者候选 + 多套方案（每套四档模型池）。空 profiles 表示功能关闭。
+			orchestration: orchestrationSettingsSchema.optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),

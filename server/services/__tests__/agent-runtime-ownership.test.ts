@@ -189,7 +189,8 @@ describe("publication release respects the runtime inbox wake decision", () => {
 					if (mode === "deferred-resume") {
 						expect(wake).not.toHaveBeenCalled();
 						expect(getExecutionOwner(CHILD)).toBeDefined();
-						run.releasePublication?.();
+						// 释放出口现在还要顺带尝试停放，等它落定再断言 owner 已归还。
+						await run.releasePublication?.();
 					}
 				}
 				// The release schedules its dynamic import without awaiting the wake.
@@ -634,7 +635,8 @@ describe("runner owns the entire finalization and publication", () => {
 			});
 		} finally {
 			await run.terminalCompletion;
-			run.releasePublication?.();
+			// 释放出口还要顺带尝试停放，所以它现在是异步的：等它落定再断言 owner 已归还。
+			await run.releasePublication?.();
 			await run.completion;
 		}
 		expect(getExecutionOwner(CHILD)).toBeUndefined();

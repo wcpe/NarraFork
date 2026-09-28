@@ -28,6 +28,7 @@ import {
 	normalizeLineEndings,
 } from "./encoding";
 import { lineStatsMetadata, wholeFileLineStats } from "./file-diff-stats";
+import { orchestratorSpecOnlyRejection } from "./orchestrator-spec-write-guard";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 import { withWorkspaceWriteLock } from "./write-serialization";
@@ -107,6 +108,9 @@ export const writeTool: ToolDefinition = {
 		const specError = toolSpecPathError("Write", args);
 		if (specError) return { output: specError, isError: true };
 		const { file_path, content } = args as { file_path: string; content: string };
+		// 编排编制者只能写 Dynamic Spec：本地路径在执行期就拒绝，不依赖工具面收窄。
+		const orchestratorRejection = orchestratorSpecOnlyRejection(ctx, file_path, "Write");
+		if (orchestratorRejection) return orchestratorRejection;
 		if (specVfsService.isSpecUri(file_path)) {
 			try {
 				const taskReflectionGranted = consumeTaskReflectionGrant(

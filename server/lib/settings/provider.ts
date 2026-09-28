@@ -7,11 +7,13 @@ import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { ModelCard } from "@shared/model-card";
 import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { firstUsableOrchestratorModel } from "@shared/orchestration-orchestrator-model";
 import { getCodexManager } from "../codex-manager";
 import { AppError, ValidationError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { getEffectiveModelMetadata } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { findEnabledProfileFrom } from "../orchestration/types";
 import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
@@ -177,6 +179,35 @@ export const FOLLOW_DEFAULT_MODEL = "__default__";
 export const FOLLOW_SUMMARY_MODEL = "__summary__";
 
 /**
+ * 编排模式哨兵前缀，形如 `__orch__:<profileId>`。
+ *
+ * 会话「当前是否处于编排模式、用的是哪个方案」刻意由 `narrators.model` 承载，
+ * 而不是新增一列：模型选择器里的选项本身就是一个模型值，选中即写入 `model`，
+ * 因此这条状态不需要迁移就能带上前端与所有既有写入路径。
+ */
+export const ORCHESTRATION_MODEL_PREFIX = "__orch__:";
+
+/** profileId 的合法字符集，与 orchestration/types.ts 的解析保持一致。 */
+const ORCHESTRATION_PROFILE_ID_PATTERN = /^[a-z0-9]+$/;
+
+/**
+ * 解析编排哨兵。严格匹配 `__orch__:` + 合法 profileId，其余一律返回 null。
+ *
+ * 不做任何「猜测式」放宽：`model` 里可能出现任意历史值，把近似值当成编排
+ * 会让一个手填的模型名意外把会话切成编排模式。
+ */
+export function parseOrchestrationModelValue(
+	value: string | null | undefined,
+): { profileId: string } | null {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	if (!trimmed.startsWith(ORCHESTRATION_MODEL_PREFIX)) return null;
+	const profileId = trimmed.slice(ORCHESTRATION_MODEL_PREFIX.length);
+	if (!ORCHESTRATION_PROFILE_ID_PATTERN.test(profileId)) return null;
+	return { profileId };
+}
+
+/**
  * Raised when the default model cannot be resolved to a concrete model.
  *
  * There is deliberately NO hardcoded fallback model. A fallback looks harmless
@@ -264,7 +295,14 @@ function getDisabledProviderPrefixes(): Set<string> {
 	return disabled;
 }
 
-function isModelProviderDisabled(modelValue: string): boolean {
+/**
+ * 该模型的提供者是否被停用（provider 自身 `disabled`，或全局 `disabledProviders`）。
+ *
+ * 导出给编排的「换模型继续」用：提供者被停用是**确定的**不可用证据，而池内全部
+ * 停用正是"池满、该放开池外"的一种情形。沿用这里而不是在调用方重写一遍停用判定，
+ * 两份实现漂移的后果是"前端放开了、服务端仍拒绝"。
+ */
+export function isModelProviderDisabled(modelValue: string): boolean {
 	const { provider } = parseModelId(modelValue);
 	return !!provider && getDisabledProviderPrefixes().has(provider);
 }
@@ -559,7 +597,53 @@ export function expandAllowedPoolForDisplay(pool: string[]): string[] {
 	return result;
 }
 
+/**
+ * 把编排哨兵解析成「该方案编制者的实际模型」。
+ *
+ * 方案不存在/未启用、或编制者模型未配置时**抛错而不是回退默认模型**：
+ * 回退会让用户看到「选了编排方案但模型没变」，而这与「方案生效、编制者恰好
+ * 就是默认模型」在界面上完全无法区分，属于静默的功能失效。
+ */
+function resolveOrchestratorModel(profileId: string, stickyProvider?: string): string {
+	const profile = findEnabledProfileFrom(s().agent?.orchestration?.profiles, profileId);
+	if (!profile) {
+		throw new ValidationError(`编排方案 "${profileId}" 不存在或未启用，请重新选择编排方案`);
+	}
+	// 清单条目既可能是历史写法的纯字符串，也可能是带思考强度的对象；
+	// 容错解析（含"取第一个可用者"）完全交给共享模块，这里不自己挑一遍。
+	const candidate = firstUsableOrchestratorModel(
+		s().agent?.orchestration?.orchestratorModels,
+	)?.model;
+	if (!candidate) {
+		throw new ValidationError(`编排方案 "${profileId}" 没有配置可用的编制者模型`);
+	}
+	// 编制者模型本身不能再是编排哨兵：那会无限递归，而且并不是可用的配置。
+	if (parseOrchestrationModelValue(candidate)) {
+		throw new ValidationError(`编排方案 "${profileId}" 的编制者模型不能指向编排方案`);
+	}
+	return resolveEffectiveModel(candidate, stickyProvider);
+}
+
+/**
+ * 解析有效模型。
+ *
+ * 出口统一加一道检查：**任何路径都不能把编排哨兵当作具体模型返回**。
+ * 哨兵只应出现在会话的 `model` 字段（由 resolveOrchestratorModel 消化）；
+ * 若它从别处冒出来（默认模型、聚合成员、被 pin 的成员），说明配置已经错位，
+ * 静默传下去的表现是 provider 报"未知模型"，而真正的原因在设置里。
+ */
 export function resolveEffectiveModel(
+	model: string | null | undefined,
+	stickyProvider?: string,
+): string {
+	const resolved = resolveEffectiveModelInner(model, stickyProvider);
+	if (parseOrchestrationModelValue(resolved)) {
+		throw new ValidationError("编排方案只能作为会话的模型选择，不能作为默认模型或聚合成员使用");
+	}
+	return resolved;
+}
+
+function resolveEffectiveModelInner(
 	model: string | null | undefined,
 	stickyProvider?: string,
 ): string {
@@ -569,6 +653,9 @@ export function resolveEffectiveModel(
 	}
 	if (!raw || isFollowDefaultModelValue(raw)) return resolveConfiguredDefaultModel(stickyProvider);
 	if (isFollowSummaryModelValue(raw)) return resolveConfiguredSummaryModel(stickyProvider);
+
+	const orchestration = parseOrchestrationModelValue(raw);
+	if (orchestration) return resolveOrchestratorModel(orchestration.profileId, stickyProvider);
 
 	const agg = parseAggModelValue(raw);
 	if (agg) {

@@ -34,6 +34,7 @@ import {
 	replacementLineStats,
 	wholeFileLineStats,
 } from "./file-diff-stats";
+import { orchestratorSpecOnlyRejection } from "./orchestrator-spec-write-guard";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 import { withWorkspaceWriteLock } from "./write-serialization";
@@ -519,6 +520,10 @@ export const editTool: ToolDefinition = {
 			new_string: string;
 			replace_all?: boolean;
 		};
+
+		// 编排编制者只能写 Dynamic Spec：本地路径在执行期就拒绝，不依赖工具面收窄。
+		const orchestratorRejection = orchestratorSpecOnlyRejection(ctx, file_path, "Edit");
+		if (orchestratorRejection) return orchestratorRejection;
 
 		if (specVfsService.isSpecUri(file_path)) {
 			try {
