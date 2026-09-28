@@ -11,12 +11,19 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { getEffectiveModelMetadata, withModelMetadataSnapshot } from "@server/lib/model-catalog";
 import { settings } from "@server/lib/settings";
+import { normalizeUsageSemantics } from "@server/lib/usage-semantics";
 import { calculateCostDetailed, type UsageData } from "@server/lib/usage-tracking";
 import { sliceToUtf8Budget, utf8Bytes, withinUtf8Budget } from "@server/lib/utf8-budget";
 import { recordCredentialUsage } from "@server/services/credential-usage-totals";
 import { insertApiRequestWithUserUsage } from "@server/services/user-usage-totals";
 import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
+import type {
+	OrchestrationContextSource,
+	OrchestrationInputTokenSemantics,
+	OrchestrationRequestRole,
+	OrchestrationUsageSource,
+} from "@shared/orchestration-observability";
 import { eq } from "drizzle-orm";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
 import type { ApiRequestDiagnostics } from "./agent/types";
@@ -45,6 +52,10 @@ export interface ApiRequestStartOptions {
 	/** Actual initiating user; unknown/system requests remain unattributed. */
 	userId?: string | null;
 	narratorId?: string | null;
+	/** 编排请求所属的独立运行；普通请求保持为空。 */
+	orchestrationRunId?: string | null;
+	/** 编排请求角色；历史/未知请求统一显示 unknown。 */
+	role?: OrchestrationRequestRole | null;
 	provider: string;
 	model: string;
 	credentialId?: string | null;
@@ -66,6 +77,13 @@ export interface ApiRequestFinishOptions {
 	messageId?: string | null;
 	credentialId?: string | null;
 	usage?: UsageData | null;
+	/** provider 返回或本地估算的 prompt 总 token。 */
+	promptTokens?: number | null;
+	/** provider 返回或模型目录提供的上下文窗口。 */
+	contextWindow?: number | null;
+	inputTokenSemantics?: OrchestrationInputTokenSemantics | null;
+	usageSource?: OrchestrationUsageSource | null;
+	contextSource?: OrchestrationContextSource | null;
 	ttftMs?: number | null;
 	durationMs?: number | null;
 	contextPercent?: number | null;
@@ -478,9 +496,24 @@ export async function finishApiRequest(
 	options: ApiRequestFinishOptions = {},
 ): Promise<string> {
 	const usage = options.usage ?? null;
+	const normalizedUsage = usage ? normalizeUsageSemantics(usage, handle.provider) : null;
 	const cost = usage
 		? calculateCostDetailed(usage, handle.provider, handle.model, handle.referencePricingSnapshot)
 		: null;
+	const inputTokenSemantics =
+		options.inputTokenSemantics && options.inputTokenSemantics !== "unknown"
+			? options.inputTokenSemantics
+			: normalizedUsage
+				? normalizedUsage.semantics === "cache-exclusive"
+					? "non_cached_input"
+					: normalizedUsage.semantics === "cache-inclusive"
+						? "total_input"
+						: "unknown"
+				: "unknown";
+	const usageSource = options.usageSource ?? (usage ? "provider" : "unknown");
+	const contextSource =
+		options.contextSource ??
+		(options.contextPercent != null || options.contextWindow != null ? "provider" : "unknown");
 	const persistenceOptions =
 		normalizedDiagnostics(options) && !allowsFullRawDump(options)
 			? { ...options, rawDump: undefined }
@@ -504,12 +537,24 @@ export async function finishApiRequest(
 		id: handle.id,
 		userId: handle.userId,
 		narratorId: handle.narratorId ?? null,
+		orchestrationRunId: handle.orchestrationRunId ?? null,
 		messageId: options.messageId ?? null,
 		kind: handle.kind,
+		role: handle.role ?? (handle.orchestrationRunId ? "unknown" : null),
 		provider: handle.provider,
 		credentialId,
 		model: handle.model,
+		// 保留 provider 原始 inputTokens。usage-history 会根据 cachedInputTokens 再按 provider
+		// 口径换算；这里提前写 uncachedInput 会让 OpenAI/Codex 被双重扣减。
 		inputTokens: usage?.inputTokens ?? 0,
+		promptTokens:
+			options.promptTokens ??
+			usage?.promptTokens ??
+			(normalizedUsage ? normalizedUsage.totalInput : null),
+		contextWindow: options.contextWindow ?? usage?.contextWindow ?? null,
+		inputTokenSemantics,
+		usageSource,
+		contextSource,
 		outputTokens: usage?.outputTokens ?? 0,
 		cachedInputTokens: usage?.cachedInputTokens ?? 0,
 		cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? 0,

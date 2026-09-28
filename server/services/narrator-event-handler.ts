@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
+import type {
+	OrchestrationLiveIdentity,
+	OrchestrationLiveObservation,
+} from "@shared/orchestration-live";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
@@ -36,6 +40,10 @@ import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import {
+	nextOrchestrationObservation,
+	resolveOrchestrationLiveIdentity,
+} from "../lib/orchestration/live";
 import {
 	DEFAULT_CONTEXT_THRESHOLDS,
 	DEFAULT_CONTEXT_WINDOW,
@@ -325,6 +333,10 @@ export interface EventHandlerContext {
 	parentToolUseId?: string;
 	/** Subagent's resolved model name (attached to broadcast messages) */
 	subagentModel?: string;
+	/** 当前实时编排身份；仅服务端观测链路使用。 */
+	orchestration?: OrchestrationLiveIdentity;
+	/** 当前 API request 的编排角色。 */
+	requestRole?: import("@shared/orchestration-observability").OrchestrationRequestRole;
 
 	// --- Mutable tracking ---
 	/** Tracks cumulative inputCharsTotal per tool_use for delta computation */
@@ -760,6 +772,97 @@ function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): bool
 	ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
 	ctx.sseEmitter?.emit("event", { type: "streaming_snapshot", data: snapshotData });
 	return true;
+}
+
+/**
+ * 发送一条有界的编排观测。
+ *
+ * 父级帧保留 coordinator 与 worker 归属；子代理自帧只保留自身身份，避免把父级
+ * tool_use 链接泄露到子代理页面。观测不落库，也不接收流式文本 chunk。
+ */
+function broadcastOrchestrationObservation(
+	ctx: EventHandlerContext,
+	input: {
+		phase: OrchestrationLiveObservation["phase"];
+		source: OrchestrationLiveObservation["source"];
+		details?: Record<string, string | number | boolean | null>;
+	},
+): void {
+	const identity =
+		ctx.orchestration ??
+		resolveOrchestrationLiveIdentity({
+			workerNarratorId: ctx.narratorId,
+			coordinatorNarratorId: ctx.broadcastTargetId,
+			parentToolUseId: ctx.parentToolUseId,
+		});
+	if (!identity) return;
+	const observation = nextOrchestrationObservation(identity, input);
+	if (!observation) return;
+	const { coordinatorNarratorId: _coordinatorNarratorId, ...selfObservation } = observation;
+	const selfMessage: NarratorServerMessage = {
+		type: "orchestration_observation",
+		narratorId: ctx.narratorId,
+		observation: selfObservation,
+	};
+	const parentMessage: NarratorServerMessage = {
+		type: "orchestration_observation",
+		narratorId: ctx.broadcastTargetId,
+		observation,
+		...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
+	};
+	dualBroadcast(ctx, selfMessage, parentMessage);
+}
+
+/**
+ * `context_usage` 的两份副本：子代理自己那份（`self`）与父级那份（`parent`）。
+ *
+ * 两份**必须不同**，而差别只在一处：父级收到的副本里 `narratorId` 指向父级自己
+ * （这是路由字段），所以它必须另带一句"这是哪只子代理的占用率"，否则父级无从把
+ * 这一行归到某个 worker 上，只能整条丢掉（`useNarratorWS` 的 `if (!data.isSubagent)`
+ * 正是这么做的），编排面板的逐 worker 上下文就只剩轮询一条路。
+ *
+ * 反向的约束同样重要：**子代理自己那份绝不能带 `subagentNarratorId`**。它的页面必须
+ * 把这一行当作普通顶层会话渲染；带上链接字段会让它被当成"某个 tool_use 的子行"，
+ * 而那个 tool_use 在它那一侧并不存在——后果是这一行永远不显示。
+ * `dualBroadcastToNarrator` 只重建 `narratorId`、不删这个字段，所以两条约束靠
+ * "父级帧走 `parentMessage`、子代理帧走 `message`"来同时成立。
+ *
+ * 抽成纯函数是为了让这两条边界可以被直接断言：它们写错既不会报类型错、也不会让
+ * 任何现有测试变红，只会让面板静默地显示"未知上下文"或让子代理页面少一行。
+ */
+export function buildContextUsageFrames(input: {
+	/** 父级（或主叙述者自己）的 id —— 也就是帧上的 `narratorId`。 */
+	broadcastTargetId: string;
+	/** 本行消息的属主：子代理时为子代理 id，主叙述者时等于 `broadcastTargetId`。 */
+	narratorId: string;
+	isSubagent: boolean;
+	snapshot?: ContextUsageSnapshot;
+	percentage: number;
+	compactStart: number;
+	promptTokens?: number;
+	contextWindow?: number;
+	isEstimated?: boolean;
+}): { parent: NarratorServerMessage; self: NarratorServerMessage } {
+	// 子代理自己那份：不带任何"这是某个孩子"的链接字段。
+	const self = {
+		type: "context_usage",
+		narratorId: input.broadcastTargetId,
+		...(input.snapshot != null && { snapshot: input.snapshot }),
+		percentage: input.percentage,
+		...(input.promptTokens != null && { promptTokens: input.promptTokens }),
+		...(input.contextWindow != null && { contextWindow: input.contextWindow }),
+		...(input.isEstimated && { isEstimated: true }),
+		compactStart: input.compactStart,
+	} as const satisfies NarratorServerMessage;
+	if (!input.isSubagent) return { parent: self, self };
+	return {
+		self,
+		parent: {
+			...self,
+			subagentNarratorId: input.narratorId,
+			isSubagent: true,
+		},
+	};
 }
 
 function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
@@ -2502,6 +2605,18 @@ export async function processEvent(
 			if (!event.isError && event.toolName === "ExitPlanMode" && hooks?.onExitPlanMode) {
 				await hooks.onExitPlanMode(event.toolUseId);
 			}
+			broadcastOrchestrationObservation(ctx, {
+				phase: "tool",
+				source: "event_handler",
+				details: {
+					event: "result",
+					toolUseId: event.toolUseId,
+					toolName: event.toolName,
+					status,
+					isError: event.isError,
+					durationMs: event.durationMs ?? null,
+				},
+			});
 			return null;
 		}
 
@@ -2549,6 +2664,15 @@ export async function processEvent(
 				toolUseId: event.toolUseId,
 				executionStartedAt: event.executionStartedAt,
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+			});
+			broadcastOrchestrationObservation(ctx, {
+				phase: "tool",
+				source: "event_handler",
+				details: {
+					event: "executing",
+					toolUseId: event.toolUseId,
+					executionStartedAt: event.executionStartedAt,
+				},
 			});
 			return null;
 		}
@@ -2828,19 +2952,28 @@ export async function processEvent(
 			const activeThresholds =
 				settings.agent.contextThresholds?.[tier] ?? DEFAULT_CONTEXT_THRESHOLDS[tier];
 
-			const isSubagent = !!ctx.parentToolUseId;
-			dualBroadcast(ctx, {
-				type: "context_usage",
-				narratorId: broadcastTargetId,
-				source: event.source,
+			const frames = buildContextUsageFrames({
+				broadcastTargetId,
+				narratorId: ctx.narratorId,
+				isSubagent: !!ctx.parentToolUseId,
 				snapshot: snapshot ?? undefined,
 				percentage: event.percentage,
-				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
-				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-				isEstimated: event.isEstimated === true,
-				...(isSubagent && { isSubagent: true }),
 				compactStart:
 					activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
+				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
+				...(event.isEstimated && { isEstimated: true }),
+			});
+			dualBroadcast(ctx, frames.self, frames.parent);
+			broadcastOrchestrationObservation(ctx, {
+				phase: "context",
+				source: "event_handler",
+				details: {
+					percentage: event.percentage,
+					promptTokens: event.promptTokens ?? null,
+					contextWindow: event.contextWindow ?? null,
+					isEstimated: event.isEstimated === true,
+				},
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "context_usage",
@@ -3170,12 +3303,23 @@ export async function processEvent(
 			ctx.apiRequestsMap.set(
 				event.requestId,
 				startApiRequest({
-					narratorId,
 					// Event owner only. Falling back to ctx.userId would re-attribute a
 					// request that arrived without a user to whoever owns the context later
 					// (e.g. a parent pass after a subagent turn) — usage stats must not
 					// invent an owner. Missing event.userId stays null.
 					userId: event.userId ?? null,
+					narratorId,
+					orchestrationRunId: event.orchestrationRunId ?? ctx.orchestration?.runId ?? null,
+					role:
+						event.role ??
+						ctx.requestRole ??
+						(ctx.orchestration?.workerRole === "reviewer"
+							? "reviewer"
+							: ctx.orchestration
+								? "worker"
+								: ctx.parentToolUseId
+									? "worker"
+									: undefined),
 					provider: event.provider,
 					model: event.model,
 					credentialId: event.credentialId,
@@ -3188,6 +3332,16 @@ export async function processEvent(
 			// arrive after that), the existing baseline is kept rather than re-measured
 			// against the already-truncated message.
 			await recordAttemptBlockBaseline(ctx, event.requestId);
+			broadcastOrchestrationObservation(ctx, {
+				phase: "api_request",
+				source: "event_handler",
+				details: {
+					event: "start",
+					requestId: event.requestId,
+					provider: event.provider,
+					model: event.model,
+				},
+			});
 			return null;
 		}
 
@@ -3257,12 +3411,25 @@ export async function processEvent(
 			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
 			if (!requestInfo) {
 				logger.warn("API request end without start", { narratorId, requestId: event.requestId });
+				broadcastOrchestrationObservation(ctx, {
+					phase: "api_request",
+					source: "event_handler",
+					details: {
+						event: "end",
+						requestId: event.requestId,
+						durationMs: event.durationMs ?? null,
+						contextPercent: event.contextPercent ?? null,
+						isError: !!event.errorMessage,
+					},
+				});
 				return null;
 			}
 
 			const usageData = event.usage
 				? {
 						inputTokens: event.usage.inputTokens ?? event.usage.promptTokens ?? 0,
+						promptTokens: event.promptTokens ?? event.usage.promptTokens,
+						contextWindow: event.contextWindow ?? event.usage.contextWindow,
 						outputTokens: event.usage.completionTokens ?? 0,
 						cachedInputTokens: event.usage.cachedInputTokens ?? 0,
 						cacheCreationInputTokens: event.usage.cacheCreationInputTokens ?? 0,
@@ -3275,6 +3442,12 @@ export async function processEvent(
 			try {
 				const apiRequestId = await finishApiRequest(requestInfo, {
 					usage: usageData,
+					promptTokens: event.promptTokens ?? event.usage?.promptTokens ?? null,
+					contextWindow: event.contextWindow ?? event.usage?.contextWindow ?? null,
+					inputTokenSemantics: event.inputTokenSemantics ?? "unknown",
+					usageSource: event.usageSource ?? (event.usage ? "provider" : "unknown"),
+					contextSource:
+						event.contextSource ?? (event.contextPercent != null ? "provider" : "unknown"),
 					credentialId: event.credentialId,
 					ttftMs: event.ttftMs ?? null,
 					durationMs: event.durationMs ?? null,
@@ -3329,6 +3502,17 @@ export async function processEvent(
 				ctx.apiRequestsMap?.delete(event.requestId);
 				ctx.pendingLeakedToolCalls?.delete(event.requestId);
 			}
+			broadcastOrchestrationObservation(ctx, {
+				phase: "api_request",
+				source: "event_handler",
+				details: {
+					event: "end",
+					requestId: event.requestId,
+					durationMs: event.durationMs ?? null,
+					contextPercent: event.contextPercent ?? null,
+					isError: !!event.errorMessage,
+				},
+			});
 			return null;
 		}
 

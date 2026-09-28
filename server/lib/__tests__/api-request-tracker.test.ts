@@ -711,4 +711,50 @@ describe("request user attribution", () => {
 		).toBeNull();
 		expect(startApiRequest({ provider: "test", model: "test", userId: null }).userId).toBeNull();
 	});
+
+	test("显式 unknown 的输入口径按 provider 默认值落库", async () => {
+		const handle = startApiRequest({ provider: "openai", model: "gpt-test" });
+		await finishApiRequest(handle, {
+			usage: { inputTokens: 100, cachedInputTokens: 30, outputTokens: 1 },
+			inputTokenSemantics: "unknown",
+		});
+		const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
+		expect(row?.inputTokenSemantics).toBe("total_input");
+	});
+
+	test("persists orchestration attribution and provider-aware prompt context fields", async () => {
+		const handle = startApiRequest({
+			provider: "anthropic",
+			model: "claude-opus-5",
+			orchestrationRunId: "run-1",
+			role: "worker",
+		});
+		await finishApiRequest(handle, {
+			usage: {
+				inputTokens: 100,
+				outputTokens: 20,
+				cachedInputTokens: 30,
+				cacheCreation5mInputTokens: 7,
+				cacheCreation1hInputTokens: 11,
+			},
+			promptTokens: 148,
+			contextWindow: 200_000,
+			contextPercent: 0.074,
+			usageSource: "provider",
+			contextSource: "provider",
+		});
+		const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
+		expect(row).toMatchObject({
+			orchestrationRunId: "run-1",
+			role: "worker",
+			inputTokens: 100,
+			inputTokenSemantics: "non_cached_input",
+			usageSource: "provider",
+			contextSource: "provider",
+			promptTokens: 148,
+			contextWindow: 200_000,
+			cacheCreation5mTokens: 7,
+			cacheCreation1hTokens: 11,
+		});
+	});
 });

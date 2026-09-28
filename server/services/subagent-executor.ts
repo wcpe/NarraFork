@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import type { OrchestrationLiveIdentity } from "@shared/orchestration-live";
+import { isPersistedFailureEnvelope } from "@shared/orchestration-worker-type";
 import { and, asc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorBufferedMessages as mailbox, narrators } from "../db/schema";
@@ -10,6 +12,7 @@ import { buildAttachedFilesHint } from "../lib/attached-files";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { resolveOrchestrationLiveIdentity } from "../lib/orchestration/live";
 import type { Locale } from "../lib/prompt-i18n";
 import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import {
@@ -133,6 +136,10 @@ export interface SubagentExecOptions {
 	parentNarratorId: string;
 	toolUseId: string;
 	subagentType: string;
+	/** 当前编排运行身份；复用/复核缺省时从服务端登记簿解析。 */
+	orchestration?: OrchestrationLiveIdentity;
+	/** 后台编排独立审计句柄。 */
+	orchestrationRun?: import("../lib/orchestration/audit").OrchestrationRunHandle | null;
 	prompt: string;
 	cwd: string;
 	model: string;
@@ -743,12 +750,14 @@ export function buildSubagentEventContext(
 	provider = resolveProvider(subagentModel),
 	locale: string = "en",
 	userId: string | null = null,
+	orchestration?: OrchestrationLiveIdentity,
 ): EventHandlerContext {
 	return createRuntimeEventContext({
 		narratorId: subagentId,
 		broadcastTargetId: parentNarratorId,
 		conversationId,
 		parentToolUseId,
+		orchestration,
 		subagentModel,
 		model: subagentModel,
 		provider,
@@ -760,6 +769,30 @@ export function buildSubagentEventContext(
 // ---------------------------------------------------------------------------
 // finalizeSubagent
 // ---------------------------------------------------------------------------
+
+/**
+ * 读回当前行里那个**必须保留**的失败信封；没有则返回 null。
+ *
+ * 只在 `hasError` 时调用，所以这是一次失败路径上的额外读，不在热路径里。
+ * 读取失败按"没有信封"处理：那是保守方向（退回写纯文本 = 原来的行为），
+ * 绝不会因为读不到行而让终态写入整个失败。
+ */
+async function readPreservedFailureEnvelope(subagentId: string): Promise<string | null> {
+	try {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, subagentId),
+			columns: { errorMessage: true },
+		});
+		const current = row?.errorMessage ?? null;
+		return isPersistedFailureEnvelope(current) ? current : null;
+	} catch (err) {
+		logger.warn("Failed to read the persisted failure envelope at subagent terminal", {
+			subagentId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return null;
+	}
+}
 
 /** Mark subagent as done/error and broadcast completion. */
 export async function finalizeSubagent(
@@ -790,9 +823,19 @@ export async function finalizeSubagent(
 			: hasError
 				? ["error"]
 				: ["unread"];
+	// 终态写入会把 `errorMessage` 换成一句人类可读的纯文本（错误卡片的正文）。
+	// 但 orchestrator 在到达这里**之前**已经写过一次结构化失败信封（配额墙 /
+	// 模型不可用 / 余额不足），而 `errorMessage` 是那类失败唯一的载体——覆盖它等于
+	// 抹掉"是哪一次请求被哪个模型拒了"，`parseModelFailureModel` 随即读不出东西，
+	// 「池内全不可用」的判定就退化成只剩"提供者停用 / 目录不可用"，
+	// 于是最典型的"池里全是同一个用尽的计划"反而永远不放开池外。
+	// 因此这里先问一句"已经有一个该留着的信封吗"，有就留着它。
+	const preservedError =
+		hasError && !options?.interrupted ? await readPreservedFailureEnvelope(subagentId) : null;
 	await narratorService.updateStatus(subagentId, "idle", {
 		substatus,
-		errorMessage: hasError && !options?.interrupted ? (errorText ?? undefined) : undefined,
+		errorMessage:
+			preservedError ?? (hasError && !options?.interrupted ? (errorText ?? undefined) : undefined),
 		skipErrorMessage: true,
 	});
 	if (options?.owner && !options.owner.isCurrent()) return;
@@ -810,6 +853,15 @@ export async function finalizeSubagent(
 		parentNarratorId,
 		toolUseId,
 	});
+
+	// 编排模式（阶段 4b）的停放**不在这里**，虽然这里是子代理唯一的"到达终态"出口。
+	//
+	// 原因：本函数被调用时，执行者自己的**执行租约还没归还**（前台路径上它是在
+	// `subagent-runner.ts` 的 `publishTerminal` 里才还的），而停放判定
+	// （`parkCompletedOrchestrationWorker` 第一步的 `isNarratorRuntimeBusy`）把
+	// "执行租约还挂在自己名下"算作"还在跑"。挂在这里的每一次前台派发都会被判忙、
+	// worker 永远进不了停放池，`claimReusableWorker` 也就永远取不到东西。
+	// 停放因此改由**租约的归还方**负责，见 `releaseForegroundLease`。
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,6 +1456,14 @@ async function runSubagentRuntime(
 			parentNarratorId: opts.parentNarratorId,
 			parentToolUseId: opts.toolUseId,
 			subagentType: opts.subagentType,
+			orchestration:
+				opts.orchestration ??
+				resolveOrchestrationLiveIdentity({
+					workerNarratorId: opts.narratorId,
+					coordinatorNarratorId: opts.parentNarratorId,
+					parentToolUseId: opts.toolUseId,
+					subagentType: opts.subagentType,
+				}),
 			customDefinition: opts.customDef,
 			systemPrompt: opts.systemPrompt,
 			initialModel: opts.model,

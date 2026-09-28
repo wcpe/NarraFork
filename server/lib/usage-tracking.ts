@@ -1,15 +1,31 @@
 import { db } from "@server/db";
 import { narratorMessages, narratorToolCalls } from "@server/db/schema";
+import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import { eq } from "drizzle-orm";
 import type { CostEstimate } from "./cost-estimate";
-import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
-import { type PriceField, referencePriceNumber, resolveModelPricing, pricingFromReferenceSnapshot } from "./model-pricing";
+import {
+	type PriceField,
+	pricingFromReferenceSnapshot,
+	referencePriceNumber,
+	resolveModelPricing,
+} from "./model-pricing";
+import { normalizeUsageSemantics } from "./usage-semantics";
 
 export type { CostData, CostEstimate, CostStatus } from "./cost-estimate";
+export type {
+	NormalizedUsageSemantics,
+	UsageInputSemantics,
+	UsageSemanticsInput,
+} from "./usage-semantics";
+export { normalizeUsageSemantics, usageInputSemantics } from "./usage-semantics";
 
 export interface UsageData {
 	inputTokens: number;
 	outputTokens: number;
+	/** provider 报告的 prompt 总 token；不参与既有成本字段计算。 */
+	promptTokens?: number;
+	/** provider 或模型目录报告的上下文窗口；不参与既有成本字段计算。 */
+	contextWindow?: number;
 	cachedInputTokens?: number;
 	cacheCreationInputTokens?: number;
 	cacheCreation5mInputTokens?: number;
@@ -47,21 +63,6 @@ export function buildUsageDataFromSnapshot(snapshot?: {
 }
 
 /**
- * Providers whose reported `input_tokens` is the *total* prompt size, cached
- * tokens included. For these, the cached portion must be subtracted before
- * applying the full input rate or those tokens get billed twice — once at the
- * input rate and again at the cache-read rate.
- *
- * Anthropic is the opposite: `input_tokens` already excludes
- * `cache_read_input_tokens` and `cache_creation_input_tokens`, so subtracting
- * would undercount.
- *
- * This set describes token semantics, not price coverage. Every provider's
- * reference price comes from the effective catalog; NUG actual billing stays separate.
- */
-const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set(["openai", "codex", "nug", "gemini"]);
-
-/**
  * Attribute a USD cost to one request's token usage using the official
  * reference prices in `model-pricing.ts`.
  *
@@ -87,20 +88,15 @@ export function calculateCostDetailed(
 	snapshot?: ReferencePricingSnapshot,
 ): CostEstimate {
 	// An explicit unknown snapshot must never fall back to a newly published price.
-	const pricing = snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
+	const pricing =
+		snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
 	const tokens = (value?: number) =>
 		typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
-	const cacheRead = tokens(usage.cachedInputTokens);
-	const cacheWrite = Math.max(
-		tokens(usage.cacheCreationInputTokens),
-		tokens(usage.cacheCreation5mInputTokens) + tokens(usage.cacheCreation1hInputTokens),
-	);
-	const reportedInput = tokens(usage.inputTokens);
-	const inclusive = PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase());
-	const input = inclusive ? Math.max(0, reportedInput - cacheRead) : reportedInput;
-	const promptTokens = inclusive
-		? reportedInput + cacheWrite
-		: reportedInput + cacheRead + cacheWrite;
+	const normalizedUsage = normalizeUsageSemantics(usage, provider);
+	const cacheRead = normalizedUsage.cachedInput;
+	const cacheWrite = normalizedUsage.cacheWrite5m + normalizedUsage.cacheWrite1h;
+	const input = normalizedUsage.uncachedInput;
+	const promptTokens = normalizedUsage.totalInput;
 	const counts: Record<PriceField, number> = {
 		input,
 		output: tokens(usage.outputTokens),

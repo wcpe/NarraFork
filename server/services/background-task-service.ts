@@ -821,6 +821,7 @@ class BackgroundTaskService {
 		parentNarratorId: string;
 		subagentNarratorId: string;
 		subagentType: string;
+		orchestrationRunId?: string | null;
 		toolUseId?: string;
 		alias?: string;
 		title?: string;
@@ -916,6 +917,7 @@ class BackgroundTaskService {
 			id: opts.id,
 			parentNarratorId: opts.parentNarratorId,
 			type: "agent",
+			orchestrationRunId: opts.orchestrationRunId ?? null,
 			status: "running",
 			subagentNarratorId: opts.subagentNarratorId,
 			subagentType: opts.subagentType,

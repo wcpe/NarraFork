@@ -10,6 +10,7 @@ import {
 } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { firstUsableOrchestratorModel } from "@shared/orchestration-orchestrator-model";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -128,6 +129,10 @@ import {
 	redactInternalTraits,
 	removeTrait,
 } from "../lib/narrator-utils";
+import { recoverOrchestrationWorker } from "../lib/orchestration/recover";
+import { findEnabledProfile } from "../lib/orchestration/runtime";
+import { orchestrationStatusResponse, readOrchestrationStatus } from "../lib/orchestration/status";
+import { orchestrationUsageResponse, readOrchestrationUsage } from "../lib/orchestration/usage";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { buildPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
@@ -152,6 +157,8 @@ import {
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
+	ORCHESTRATION_MODEL_PREFIX,
+	parseOrchestrationModelValue,
 	resolveEffectiveModel,
 	settings,
 } from "../lib/settings";
@@ -4811,6 +4818,12 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorModelSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// 编排哨兵有专门的入口（PATCH /:id/orchestration），它会校验方案存在、启用且
+	// 配了编制者模型。这里放行等于给出一条绕过那层校验的路径，写进去的值直到
+	// 下次会话装配才会炸，错误还指向别处。
+	if (parseOrchestrationModelValue(parsed.data.model)) {
+		throw new ValidationError("编排模式请使用编排方案入口切换");
+	}
 	const narrator = await narratorService.getById(id);
 	if (parsed.data.model === FOLLOW_PARENT_MODEL) {
 		if (!isSubagentVariant(narrator.variant)) {
@@ -4824,6 +4837,142 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	await narratorService.updateModel(id, parsed.data.model);
 	await updateNarratorModel(id, parsed.data.model);
 	return c.json({ ok: true });
+});
+
+/**
+ * 进入/退出编排模式。
+ *
+ * 编排状态由 `model` 的哨兵（`__orch__:<profileId>`）承载，因此这里做的其实是
+ * "写一个受校验的模型值"：不需要新列，也不会被迁移阻塞。校验（方案存在且启用、
+ * 配了编制者模型、会话是主叙述者）都放在写入之前，避免把一个解析不出编制者
+ * 模型的哨兵落库——那会让会话在下次装配时才失败。
+ */
+narratorRoutes.patch("/:id/orchestration", async (c) => {
+	const id = c.req.param("id");
+	const body = (await c.req.json()) as unknown;
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		throw new ValidationError("请求体必须是对象");
+	}
+	const raw = (body as Record<string, unknown>).profileId;
+	if (raw !== null && raw !== undefined && typeof raw !== "string") {
+		throw new ValidationError("profileId 必须是字符串或 null");
+	}
+	const narrator = await narratorService.getById(id);
+	// 执行者由编制者派生；让子代理进入编排模式只会得到一个没有下级的编制者。
+	if (isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("只有主叙述者可以进入编排模式");
+	}
+
+	let nextModel: string;
+	if (raw == null) {
+		// 退出编排模式：回到会话原本的默认模型语义，而不是把哨兵留在库里。
+		nextModel = settings.agent.defaultModel?.trim() || FOLLOW_DEFAULT_MODEL;
+	} else {
+		const profileId = raw.trim();
+		const encoded = `${ORCHESTRATION_MODEL_PREFIX}${profileId}`;
+		if (!parseOrchestrationModelValue(encoded)) {
+			throw new ValidationError("编排方案 ID 只能由小写字母与数字组成");
+		}
+		if (!findEnabledProfile(profileId)) {
+			throw new ValidationError(`编排方案 "${profileId}" 不存在或未启用`);
+		}
+		// 「有没有可用的编制者模型」与服务端装配（`settings/provider.ts`）必须
+		// 用同一份容错解析：清单条目可以是纯字符串或带思考强度的对象，
+		// 各判一次就会出现"这里放行、装配时抛错"（或反过来）。
+		const hasOrchestratorModel =
+			firstUsableOrchestratorModel(settings.agent?.orchestration?.orchestratorModels) !== null;
+		if (!hasOrchestratorModel) {
+			throw new ValidationError(`编排方案 "${profileId}" 没有配置可用的编制者模型`);
+		}
+		nextModel = encoded;
+	}
+
+	await narratorService.updateModel(id, nextModel);
+	// 这条既有路径会解析有效模型、同步 active._orchestrationProfileId 并广播
+	// model_changed / model_settings_changed，因此不需要在这里另发广播。
+	await updateNarratorModel(id, nextModel);
+	return c.json({ ok: true, model: nextModel });
+});
+
+/**
+ * 编排状态（只读观测）。
+ *
+ * 与上面的 `PATCH /:id/orchestration` 共用同一个"是否处于编排模式"的判定
+ * （`model` 上的哨兵），因此不会出现"模型位说在编排、状态查询说不在"的分叉。
+ * 非编排会话返回 `{ orchestration: null }` 而不是 404：这是界面按需轮询的探测
+ * 接口，"不在编排模式"是正常答案，不是错误。
+ *
+ * 只读：不写任何行、不改停放登记簿、不占并发位。读取逻辑全在
+ * `lib/orchestration/status.ts`——按主键取一行 + 按 `parent_narrator_id` 取该会话
+ * 的直接子代（有索引、有读取预算、只取必要列），以及按 `coordinator_narrator_id`
+ * 取有界的派发窗口。
+ *
+ * `?limit=` 只影响返回的**最近派发条数**（默认 20、封顶 100，非法值退回默认）；
+ * 分档聚合的口径固定，不随它变化。条数上限由 `lib/orchestration/audit.ts` 自己收，
+ * 因此这里只管把裸值传进去。
+ */
+narratorRoutes.get("/:id/orchestration/status", async (c) => {
+	const id = c.req.param("id");
+	const rawLimit = c.req.query("limit");
+	const runLimit = rawLimit === undefined ? undefined : Number(rawLimit);
+	return c.json(orchestrationStatusResponse(await readOrchestrationStatus(id, { runLimit })));
+});
+
+/**
+ * 编排开销（token）。
+ *
+ * 与状态分成两个接口，而不是塞进同一个响应里：状态是"现在是什么"（秒级轮询、每轮都要
+ * 便宜），开销是"累计花了多少"（随会话增长，只有打开详情面板时才需要）。合成的后果是
+ * 每次轮询都要跑一遍分组聚合，而那份开销没有任何渲染决策依赖它。
+ *
+ * 非编排会话同样返回 `{ usage: null }`。读取逻辑全在 `lib/orchestration/usage.ts`：
+ * 两次有界、走索引、只取小列的查询，失败时返回 `null` 而不抛。
+ */
+narratorRoutes.get("/:id/orchestration/usage", async (c) => {
+	const id = c.req.param("id");
+	return c.json(orchestrationUsageResponse(await readOrchestrationUsage(id)));
+});
+
+/**
+ * 换模型继续：让撞上配额 / 余额 / 模型不可用的编排 worker 带着已有上下文接着干。
+ *
+ * 挂在 `:id` 为上（编制者）而不是 worker 上，因为校验必须知道"哪个编排"——
+ * 目标模型只允许取自该 worker 档位的池，而池属于方案，方案只挂在编制者身上。
+ *
+ * 全部业务校验与写入顺序都在 `lib/orchestration/recover.ts`；这里只负责解析
+ * 请求体、取调用者身份与语言，然后把结果原样返回。失败一律是 `ValidationError`，
+ * 中文原因由全局错误处理器序列化给前端。
+ */
+narratorRoutes.post("/:id/orchestration/recover", async (c) => {
+	const id = c.req.param("id");
+	const body = (await c.req.json()) as unknown;
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		throw new ValidationError("请求体必须是对象");
+	}
+	const raw = body as Record<string, unknown>;
+	const workerNarratorId = raw.workerNarratorId;
+	if (typeof workerNarratorId !== "string" || workerNarratorId.trim().length === 0) {
+		throw new ValidationError("workerNarratorId 必须是非空字符串");
+	}
+	const model = raw.model;
+	if (typeof model !== "string" || model.trim().length === 0) {
+		throw new ValidationError("model 必须是非空字符串");
+	}
+	const action = raw.action ?? "continue";
+	if (action !== "continue" && action !== "retry") {
+		throw new ValidationError('action 必须是 "continue" 或 "retry"');
+	}
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const outcome = await recoverOrchestrationWorker({
+		primaryNarratorId: id,
+		workerNarratorId,
+		model,
+		action,
+		locale,
+		createdBy: userId,
+	});
+	return c.json(outcome);
 });
 
 // Update permission mode

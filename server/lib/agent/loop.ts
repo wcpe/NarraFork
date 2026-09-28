@@ -178,10 +178,13 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	Glob: { short: ["pattern", "path"], large: [] },
 	Read: { short: ["file_path", "offset", "limit"], large: [] },
 	Agent: {
-		short: ["description", "subagent_type", "model", "reasoning_effort"],
+		short: ["description", "subagent_type", "tier", "model", "reasoning_effort"],
 		large: ["prompt"],
 	},
-	Task: { short: ["description", "subagent_type", "model", "reasoning_effort"], large: ["prompt"] },
+	Task: {
+		short: ["description", "subagent_type", "tier", "model", "reasoning_effort"],
+		large: ["prompt"],
+	},
 	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
 	Send: {
 		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
@@ -1220,6 +1223,11 @@ async function recordReflectionApiRequestEnd(
 			credentialId: event.credentialId,
 			ttftMs: event.ttftMs ?? null,
 			durationMs: event.durationMs ?? null,
+			promptTokens: event.promptTokens ?? event.usage?.promptTokens ?? null,
+			contextWindow: event.contextWindow ?? event.usage?.contextWindow ?? null,
+			inputTokenSemantics: event.inputTokenSemantics ?? "unknown",
+			usageSource: event.usageSource ?? (event.usage ? "provider" : "unknown"),
+			contextSource: event.contextSource ?? (event.contextPercent != null ? "provider" : "unknown"),
 			contextPercent: event.contextPercent ?? null,
 			contextSnapshot: event.contextSnapshot,
 			meterUsage: event.meterUsage ?? null,
@@ -1396,6 +1404,14 @@ export async function runReflectionLoop(
 						model: event.model,
 						credentialId: event.credentialId,
 						kind: "reflection",
+						orchestrationRunId: parentConfig.orchestration?.runId ?? null,
+						role:
+							parentConfig.requestRole ??
+							(parentConfig.orchestration?.workerRole === "reviewer"
+								? "reviewer"
+								: parentConfig.orchestration
+									? "worker"
+									: undefined),
 					}),
 				);
 				continue;
@@ -3772,9 +3788,13 @@ async function* agentLoopInMetadataSnapshot(
 						cacheCreationInputTokens?: number;
 						cacheCreation5mTokens?: number;
 						cacheCreation1hTokens?: number;
+						contextWindow?: number;
 				  }
 				| undefined;
 			let requestContextPercent: number | undefined;
+			let requestContextWindow: number | undefined;
+			let requestUsageSource: "provider" | "estimated" | "unknown" = "unknown";
+			let requestContextSource: "provider" | "estimated" | "unknown" = "unknown";
 			let upstreamContextPercent: number | undefined;
 			let requestRawContextWindow: number | undefined;
 			let inputCharacters: ContextInputCharacters | null = null;
@@ -3891,6 +3911,14 @@ async function* agentLoopInMetadataSnapshot(
 					model: effectiveModel,
 					credentialId,
 					referencePricingSnapshot: captureReferencePricingSnapshot(effectiveModel),
+					orchestrationRunId: config.orchestration?.runId ?? null,
+					role:
+						config.requestRole ??
+						(config.orchestration?.workerRole === "reviewer"
+							? "reviewer"
+							: config.orchestration
+								? "worker"
+								: undefined),
 				};
 			}
 
@@ -4019,6 +4047,10 @@ async function* agentLoopInMetadataSnapshot(
 							getModelContextWindow(effectiveModel, effectiveProvider) ?? null,
 							null,
 						),
+					promptTokens: requestUsage?.promptTokens ?? getEstimatedUpstreamPromptTokens(),
+					contextWindow: requestUsage?.contextWindow ?? requestContextWindow,
+					usageSource: requestUsageSource,
+					contextSource: requestContextSource,
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
 					contextPercent: requestContextPercent,
@@ -4446,6 +4478,9 @@ async function* agentLoopInMetadataSnapshot(
 				upstreamContextPercent = undefined;
 				requestRawContextWindow = undefined;
 				requestContextPercent = undefined;
+				requestContextWindow = undefined;
+				requestUsageSource = "unknown";
+				requestContextSource = "unknown";
 				requestMeterUsage = undefined;
 				requestMeterUnit = undefined;
 				requestDiagnostics = undefined;
@@ -5242,6 +5277,9 @@ async function* agentLoopInMetadataSnapshot(
 								requestRawContextWindow ?? getModelContextWindow(effectiveModel, effectiveProvider);
 							upstreamContextPercent = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
 							requestContextPercent = upstreamContextPercent;
+							requestContextWindow = ctxWin ?? undefined;
+							if (requestUsageSource !== "provider") requestUsageSource = "estimated";
+							requestContextSource = "estimated";
 							const estimatedPromptTokens = getEstimatedUpstreamPromptTokens();
 							yield {
 								type: "context_usage",
@@ -5310,10 +5348,15 @@ async function* agentLoopInMetadataSnapshot(
 									parsed.usage.cacheCreation5mTokens ?? previousUsage?.cacheCreation5mTokens,
 								cacheCreation1hTokens:
 									parsed.usage.cacheCreation1hTokens ?? previousUsage?.cacheCreation1hTokens,
+								contextWindow: parsed.usage.contextWindow ?? previousUsage?.contextWindow,
 							};
+							requestUsageSource = "provider";
 							const contextWindow =
 								parsed.usage.contextWindow ??
 								getModelContextWindow(effectiveModel, effectiveProvider);
+							requestContextWindow = contextWindow ?? requestContextWindow;
+							requestContextSource =
+								parsed.usage.contextWindow != null ? "provider" : requestContextSource;
 							// Guard: only emit context_usage when promptTokens > 0.
 							// Some Anthropic-compatible APIs (e.g. Xiaomi Mimo) send
 							// { input_tokens: 0, output_tokens: 0 } in message_start and

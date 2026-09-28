@@ -3392,14 +3392,30 @@ export const apiRequests = sqliteTable(
 		agentLabel: text("agent_label"),
 		// 关联的 assistant message ID（一个请求可能产生一个 assistant message）
 		messageId: text("message_id").references(() => narratorMessages.id, { onDelete: "set null" }),
+		/** 编排运行 id；历史请求和非编排请求保持 NULL。 */
+		orchestrationRunId: text("orchestration_run_id"),
 		// 请求用途：narrator / compact / title / external / internal 等
 		kind: text("kind").notNull().default("narrator"),
+		/** 编排请求角色；旧数据缺失时由共享契约归一为 unknown。 */
+		role: text("role", { enum: ["orchestrator", "worker", "reviewer", "unknown"] }),
 		// 提供商和模型信息
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
 		// Token 使用统计
 		inputTokens: integer("input_tokens").notNull().default(0),
+		/** provider 返回的 prompt 总 token；与 input_tokens 的口径刻意分开。 */
+		promptTokens: integer("prompt_tokens"),
+		/** provider 或本地模型元数据给出的上下文窗口大小。 */
+		contextWindow: integer("context_window"),
+		/** input_tokens 的口径来源；旧数据缺失时由共享契约归一为 unknown。 */
+		inputTokenSemantics: text("input_token_semantics", {
+			enum: ["non_cached_input", "total_input", "prompt_total", "unknown"],
+		}),
+		/** token usage 的来源；只存窄枚举，不存上游响应正文。 */
+		usageSource: text("usage_source", { enum: ["provider", "estimated", "unknown"] }),
+		/** contextPercent/contextWindow 的来源；只存窄枚举。 */
+		contextSource: text("context_source", { enum: ["provider", "estimated", "unknown"] }),
 		outputTokens: integer("output_tokens").notNull().default(0),
 		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
 		cacheCreationInputTokens: integer("cache_creation_input_tokens").notNull().default(0),
@@ -3435,10 +3451,23 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_message").on(table.messageId),
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
+		// run 级观测按时间游标读取请求，避免扫描全表。
+		index("idx_api_requests_orchestration_run_created").on(
+			table.orchestrationRunId,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
+		check(
+			"ck_api_requests_observation_tokens",
+			sql`
+			(${table.promptTokens} IS NULL OR (typeof(${table.promptTokens}) = 'integer' AND ${table.promptTokens} >= 0 AND ${table.promptTokens} <= 2000000000))
+			AND (${table.contextWindow} IS NULL OR (typeof(${table.contextWindow}) = 'integer' AND ${table.contextWindow} >= 0 AND ${table.contextWindow} <= 2000000000))
+		`,
+		),
 	],
 );
 
@@ -3842,6 +3871,8 @@ export const backgroundTasks = sqliteTable(
 		type: text("type", { enum: ["bash", "agent", "transfer"] }).notNull(),
 		/** Durable publication run identity. NULL marks legacy tasks awaiting explicit registration. */
 		logicalRunId: text("logical_run_id"),
+		/** 编排运行 id；独立于 logicalRunId，避免把发布幂等键当作编排观测键。 */
+		orchestrationRunId: text("orchestration_run_id"),
 		status: text("status", {
 			/**
 			 * `paused` exists only for `transfer` rows: a device transfer keeps a resume
@@ -3904,6 +3935,13 @@ export const backgroundTasks = sqliteTable(
 		// Without it a parent with hundreds of tasks sorts its whole history on every
 		// page request.
 		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
+		// run 级观测按编排运行筛选任务，并保留状态与时间游标。
+		index("idx_bg_tasks_orchestration_run").on(
+			table.orchestrationRunId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
 	],
 );
 
@@ -5799,6 +5837,105 @@ export const notifications = sqliteTable(
 			table.status,
 			table.createdAt,
 			table.id,
+		),
+	],
+);
+
+// === orchestration_runs (编排派发的审计记录) ===
+/**
+ * 一次编排派发（编制者用 `Agent` 工具的 `tier` 派发一个 worker）的审计行。
+ *
+ * 存在的理由只有一条：**让「编排开销」与「执行开销」可以归集对比**。`api_requests`
+ * 已经有逐请求的 token / model / cost，但没有「这是第几次派发、哪个档位」这一维，
+ * 于是"第三次派发比第一次快了多少、省了多少"根本无从算起。本表补上那一维：
+ * 每行一次派发，`worker_narrator_id` 与 `coordinator_narrator_id` 就是 join 键。
+ *
+ * **刻意不加外键**（两个 narrator 列都是纯 text）：审计记录必须在 narrator 被删除
+ * 之后仍然存在——否则"删掉一个 worker"会顺手抹掉它花过多少钱的证据，而审计的
+ * 全部价值就在于事后还能查。这与 `scheduled_task_runs.narrator_id` 是同一条选择，
+ * 消费方（UI / 查询接口）都必须容忍被引用行已不存在。
+ *
+ * **不存大字段**：`error` 写入前截断（见 `lib/orchestration/audit.ts` 的
+ * `MAX_ORCHESTRATION_ERROR_CHARS`），`verdict` 只存枚举而非回执正文——回执本身
+ * 已经在叙述者消息里，重复存一份只会让这张表随对话增长。
+ */
+export const orchestrationRuns = sqliteTable(
+	"orchestration_runs",
+	{
+		id: text("id").primaryKey(),
+		/** 编制者（primary）的 narrator id。不删则已，删了这行也留着。 */
+		coordinatorNarratorId: text("coordinator_narrator_id").notNull(),
+		/** 编排方案 id（`settings.agent.orchestration.profiles[].id`）。 */
+		profileId: text("profile_id").notNull(),
+		/** 派发档位。取值与编排实现同源（chore/quick/medium/heavy）。 */
+		tier: text("tier", { enum: ["chore", "quick", "medium", "heavy"] }).notNull(),
+		/** 执行者 narrator id；派发失败在确认执行者之前时为 null。 */
+		workerNarratorId: text("worker_narrator_id"),
+		/** 本次档位选中的模型（完整引用 "provider:modelId"）。 */
+		model: text("model"),
+		/**
+		 * 结局阶段。写入时先落 `dispatched`（派发开始），收尾再更新为终态：
+		 * - `dispatched`：派发本身结束，但没有跑过任何复核（两个开关都关着，
+		 *   或者后台派发——后台的执行者此刻还在跑，这一行会一直停在 `dispatched`
+		 *   且 `finished_at` 为空，那是"未收尾"而不是"很快"）；
+		 * - `self_reviewed`：执行者续跑了一轮自审；
+		 * - `reviewed`：另有独立只读复核者跑过；
+		 * - `failed`：这次派发整体失败（执行者没起来或抛错）。
+		 */
+		phase: text("phase", {
+			enum: ["dispatched", "self_reviewed", "reviewed", "failed"],
+		}).notNull(),
+		/** 当前运行阶段；历史行和尚未接入进度写入的行均为 unknown。 */
+		currentPhase: text("current_phase", {
+			enum: [
+				"dispatching",
+				"executing",
+				"self_reviewing",
+				"reviewing",
+				"completed",
+				"failed",
+				"unknown",
+			],
+		})
+			.notNull()
+			.default("unknown"),
+		/** 单调递增的运行内进度序号；没有进度事件时为 NULL。 */
+		lastProgressSeq: integer("last_progress_seq"),
+		/** 最近一次进度事件时间；没有进度事件时为 NULL。 */
+		lastProgressAt: text("last_progress_at"),
+		/**
+		 * 重派次数。当前实现**不做自动重派**（是否重派是编制者的决定，见
+		 * `finishOrchestratedDispatch` 的说明），因此恒为 0；字段预留给未来的重派计数。
+		 */
+		attempt: integer("attempt").notNull().default(0),
+		/** 本次是否复用了停放池里的 worker（新建则为 false）。 */
+		reusedWorker: integer("reused_worker", { mode: "boolean" }).notNull().default(false),
+		/** 执行者回执的 verdict；未解析出回执时为 null。只存枚举，不存正文。 */
+		verdict: text("verdict", { enum: ["pass", "fail", "partial"] }),
+		/** 失败原因，写入前截断（见 audit 模块的错误上限）。 */
+		error: text("error"),
+		/** ISO 时间戳。 */
+		startedAt: text("started_at").notNull(),
+		/** ISO 时间戳；未收尾（后台派发仍在跑 / 进程中途退出）时为 null。 */
+		finishedAt: text("finished_at"),
+		/** `finished_at - started_at`（毫秒）；收尾时算不出则为 null。 */
+		durationMs: integer("duration_ms"),
+	},
+	(table) => [
+		// 主查询：某个编制者最近的派发历史（聚合与最近 N 条都走这个前缀）。
+		index("idx_orchestration_runs_coordinator_started").on(
+			table.coordinatorNarratorId,
+			table.startedAt,
+		),
+		// 按执行者反查它的每次派发（与 api_requests 归集开销时用）。
+		index("idx_orchestration_runs_worker").on(table.workerNarratorId),
+		// 全局清理与统计（无 coordinator 前缀的扫描）。
+		index("idx_orchestration_runs_started").on(table.startedAt),
+		// 运行中的进度观测按阶段和最近更新时间读取。
+		index("idx_orchestration_runs_progress").on(table.currentPhase, table.lastProgressAt),
+		check(
+			"ck_orchestration_runs_progress_seq",
+			sql`(${table.lastProgressSeq} IS NULL OR (typeof(${table.lastProgressSeq}) = 'integer' AND ${table.lastProgressSeq} >= 0 AND ${table.lastProgressSeq} <= 2000000000))`,
 		),
 	],
 );

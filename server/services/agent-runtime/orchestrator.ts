@@ -54,6 +54,10 @@ import {
 import { nugAvailabilityPoller } from "../../lib/nug-availability-poller";
 import { resolveKnownUnavailableNugModel } from "../../lib/nug-model-availability";
 import { markNugCachedModelUnavailable } from "../../lib/nug-model-cache";
+import {
+	ORCHESTRATOR_TOOLS,
+	resolveExecutionAllowedTools,
+} from "../../lib/orchestration/tier-definition";
 import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
 import {
@@ -164,8 +168,8 @@ import {
 	persistConversationIdIfUnchanged,
 	prepareSubagentConclusionReference,
 	rearmCutInSoftStopBeforeContinuing,
-	resolveRuntimeReasoningEffort,
 	resolveSessionDevices,
+	resolveSessionReasoningEffort,
 	setNarratorDefaultDevice,
 	settleNarratorRuntimeModel,
 	updateNarratorModel,
@@ -350,7 +354,17 @@ export async function runAgentLoopUnlocked(
 	const runState = createRuntimeRunState({ kind: "current", text, images }, profile);
 	const runtimePolicy = resolveRuntimePolicy(
 		profile.kind === "primary"
-			? { variant: "primary" }
+			? {
+					variant: "primary",
+					// 编排模式下编制者只应派发任务，不该自己翻代码：
+					// 工具面收窄到 ORCHESTRATOR_TOOLS（这里是"声明"，toolFilter 是"可见性"）。
+					...(active._orchestrationProfileId
+						? {
+								extraToolNames: ORCHESTRATOR_TOOLS,
+								orchestrationProfileId: active._orchestrationProfileId,
+							}
+						: {}),
+				}
 			: {
 					variant: "subagent",
 					subagentType: profile.subagentType,
@@ -654,11 +668,16 @@ export async function runAgentLoopUnlocked(
 					active._settingsRevision = getSettingsRevision();
 					active.model = resolveEffectiveModel(modelSelectionRef, active.provider);
 					active.provider = resolveProvider(active.model);
-					active.reasoningEffort = resolveRuntimeReasoningEffort(
-						active.provider,
-						active.model,
-						active._reasoningEffortRef,
-					);
+					// 这里刚把 `_reasoningEffortRef` 重设成库里那份值，因此必须重走一遍
+					// 完整的回落链（而不是只读那个 ref）：否则装配时算好的编制者强度会在
+					// **本次运行的第一个 pass 开头**被覆盖掉，表现为"设置页配了强度，
+					// 会话一跑就变回默认值"。
+					active.reasoningEffort = resolveSessionReasoningEffort({
+						provider: active.provider,
+						model: active.model,
+						explicit: active._reasoningEffortRef,
+						orchestrationProfileId: active._orchestrationProfileId,
+					});
 				}
 			}
 			runState.initialSettingsApplied = true;
@@ -790,6 +809,7 @@ export async function runAgentLoopUnlocked(
 				// Same reason as in rebuildSystemPrompt: a legacy plan path cannot be rebuilt
 				// from the identity, and the reminder must name the file the gate allows.
 				active._planFilePath,
+				active._orchestrationProfileId,
 			);
 			active.systemPrompt =
 				profile.kind === "subagent"
@@ -825,6 +845,15 @@ export async function runAgentLoopUnlocked(
 				// Subagent dual-broadcast fields — when set, dualBroadcast sends
 				// events to both the parent narrator and the subagent's own page.
 				parentToolUseId: saParentToolUseId,
+				orchestration: profile.kind === "subagent" ? profile.orchestration : undefined,
+				requestRole:
+					profile.kind === "primary"
+						? "orchestrator"
+						: profile.orchestration?.workerRole === "reviewer"
+							? "reviewer"
+							: profile.orchestration
+								? "worker"
+								: undefined,
 				subagentModel: saParentNarratorId ? resolved.model : undefined,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
@@ -920,6 +949,7 @@ export async function runAgentLoopUnlocked(
 						// reconstruct from the identity alone, so passing it is what stops the
 						// model being told to write somewhere the gate then rejects.
 						active._planFilePath,
+						active._orchestrationProfileId,
 					);
 					const hint = await buildPendingQuestionHint(narratorId);
 					const finalPrompt = hint ? `${prompt}\n\n${hint}` : prompt;
@@ -1323,6 +1353,15 @@ export async function runAgentLoopUnlocked(
 				chapterId: active._chapterId,
 				parentNarratorId: saParentNarratorId,
 				parentToolUseId: saParentToolUseId,
+				orchestration: profile.kind === "subagent" ? profile.orchestration : undefined,
+				requestRole:
+					profile.kind === "primary"
+						? "orchestrator"
+						: profile.orchestration?.workerRole === "reviewer"
+							? "reviewer"
+							: profile.orchestration
+								? "worker"
+								: undefined,
 				reviewReadOnlyBash: profile.kind === "subagent" && profile.subagentType === "review",
 				// Plan mode can be toggled MANUALLY while this pass is running, so both flags
 				// are read live rather than frozen here. `_planModeLive`/`_relaxedPlanLive` are
@@ -1417,7 +1456,14 @@ export async function runAgentLoopUnlocked(
 					: undefined,
 				resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
 				disabledTools: active._disabledTools,
-				allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
+				// 执行期闸门：可见性（policy 的 extraToolNames + 上面的 toolFilter）只决定
+				// 发给模型的工具数组里有什么，模型硬发一个未列出的调用时挡不住它。编制者
+				// 因此必须在这里也下发白名单，并与 OAuth 白名单取交集（编排不是第二条绕过
+				// OAuth 的授权来源）。身份取自已解析的结构化字段，不从工具面形状反推。
+				allowedTools: resolveExecutionAllowedTools({
+					isOrchestrator: runtimePolicy.orchestration?.profileId !== undefined,
+					oauthAllowedTools: oauthRuntime?.allowedTools,
+				}),
 				allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
 				onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
 					narratorId,
@@ -1442,6 +1488,16 @@ export async function runAgentLoopUnlocked(
 				// Exclude optional tools that haven't been loaded for this session.
 				toolFilter: (tool) => {
 					if (!profileToolFilter(tool)) return false;
+					// 编排编制者的第二道闸门：policy 管工具声明，这里管最终可见性。
+					// 任一单独都可能被后续改动绕过（例如某个预加载集合重新放行工具）。
+					// 只作用于 primary —— 执行者必须保有它们的完整工具等级。
+					if (
+						profile.kind === "primary" &&
+						active._orchestrationProfileId &&
+						!ORCHESTRATOR_TOOLS.includes(tool.name)
+					) {
+						return false;
+					}
 					if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 					if (active._disabledTools.has(tool.name)) return false;
 					// When all skills are blocked, hide the Skill tool entirely.
@@ -1580,11 +1636,15 @@ export async function runAgentLoopUnlocked(
 						const resolvedModel = resolveEffectiveModel(modelRef, active.provider);
 						active.model = resolvedModel;
 						active.provider = resolveProvider(resolvedModel);
-						active.reasoningEffort = resolveRuntimeReasoningEffort(
-							active.provider,
-							active.model,
-							active._reasoningEffortRef,
-						);
+						// 配置侧强度在这里现读：设置页改了编排强度会让 settings 修订号变化，
+						// 于是「改完设置不必重开会话」这条也能成立。快照在装配时的做法会让
+						// 旧值一直留到一个本来没人知道需要做的重建之后。
+						active.reasoningEffort = resolveSessionReasoningEffort({
+							provider: active.provider,
+							model: active.model,
+							explicit: active._reasoningEffortRef,
+							orchestrationProfileId: active._orchestrationProfileId,
+						});
 					}
 
 					const next: import("../../lib/agent").RuntimeSettingsOverride = {};

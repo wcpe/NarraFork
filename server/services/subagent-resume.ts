@@ -60,6 +60,8 @@ export interface ResumeSubagentInput {
 	bindingNarratorId?: string;
 	/** Includes pre-continuation denied-tool I/O in the run's attribution window. */
 	fileChangeStartedAt?: string;
+	/** 续跑时沿用当前派发的编排运行身份；不复用旧 worker 的历史 run。 */
+	orchestration?: import("@shared/orchestration-live").OrchestrationLiveIdentity;
 	/** Trusted automatic-continuation identity, separate from message audit author. */
 	executionPrincipal?: import("./narrator-question-service").QuestionExecutionPrincipal;
 	/** Wake an already accepted mailbox head without creating a second user message. */
@@ -112,6 +114,16 @@ export interface ResumeSubagentInput {
 	skipConclusionDelivery?: boolean;
 	/** Keep a recovered Agent checkpointable by subsequent planned updates. */
 	resumableUpdateLease?: boolean;
+	/**
+	 * 本次派发在父级页面上对应的工具卡片（provider `tool_use` id）。
+	 *
+	 * 只有"一个 worker 被派发多次"的调用方需要给：worker 的创建溯源
+	 * （`narrators.origin_tool_call_id` → 首次派发那张卡片）是单值的、且被 ACL / revert /
+	 * COW 校验共用，不能改写；复用的那几次必须把**本次**卡片记在别处，而 worker
+	 * 这一轮的提示轮就是那个"别处"——它的 `parent_tool_use_id` 决定活动摘要的归属。
+	 * 省略时行为与以前完全一致（落在创建溯源那张卡片下）。
+	 */
+	dispatchAnchorToolUseId?: string;
 	/** Persisted logical run from the planned-update checkpoint, never an execution epoch. */
 	resumeLogicalRunId?: string;
 	/** Remaining execution timeout passed to the continued runner. */
@@ -553,6 +565,16 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 
 		// A standalone tool-use id is a message transport link only, never an Agent origin.
 		const originToolUseId = linkedOrigin ?? `standalone-${input.subagentId}`;
+		/**
+		 * 这一轮消息该落在**哪张工具卡片**下。
+		 *
+		 * 默认就是 worker 的创建溯源（首次派发那张卡片）。复用停放 worker 时不是：同一个
+		 * worker 会被派发多次，本次派发的那张卡片才是这一轮消息的落点——它既是父级页面上
+		 * "这次派发由谁执行"的归属依据（活动摘要按落点取 owner），也决定 `subagent_started`
+		 * 广播该刷新哪张卡。**只影响落点，不影响结论投递**：复用路径一律
+		 * `skipConclusionDelivery`，改写历史那次的工具结果仍然是被禁止的。
+		 */
+		const anchorToolUseId = input.dispatchAnchorToolUseId ?? originToolUseId;
 		let effectiveInput = input;
 		// Set by the regenerate_edited_message branch below, then attached to every
 		// return path so the advisory is not lost between the rollback and the reply.
@@ -790,7 +812,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					userMessage = await narratorService.persistSubagentUserMessage(
 						input.subagentId,
 						prepared.prompt,
-						originToolUseId,
+						anchorToolUseId,
 						{
 							images: input.images,
 							textFiles: savedTextFiles,
@@ -875,9 +897,11 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				bindingNarratorId: input.bindingNarratorId,
 				fileChangeStartedAt: effectiveInput.fileChangeStartedAt,
 				deferPublicationRelease: true,
+				orchestration: input.orchestration,
 				subagentId: input.subagentId,
 				parentNarratorId: original.parentNarratorId,
-				toolUseId: originToolUseId,
+				// 落点而非创建溯源：复用派发要落在**本次**那张卡片下（见 `anchorToolUseId`）。
+				toolUseId: anchorToolUseId,
 				prompt: prepared.prompt,
 				images: input.images,
 				textFiles: input.textFiles,
@@ -962,6 +986,10 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					}
 					return output;
 				})
+				// 续跑路径唯一的租约归还出口。返回这个 promise 而不是丢弃它：释放现在不止
+				// 归还租约，还要在归还**之后**把 worker 停放回池（见 `releaseContinuationLease`），
+				// 让 `terminalCompletion` 等到停放落定——调用方 await 到终态时，
+				// "worker 已回池"就是既成事实，而不是一次赛跑。
 				.finally(() => started.releasePublication?.());
 			const settledCompletion = terminalCompletion.catch(async (error) => {
 				logger.error("Resumed subagent run failed", {

@@ -11,6 +11,7 @@ import type {
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type { OrchestrationLiveObservation } from "@shared/orchestration-live";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
@@ -77,6 +78,12 @@ export type NarratorServerMessage =
 	| NarratorListStateSnapshotMessage
 	| { type: "message"; narratorId: string; message: unknown }
 	| { type: "stream_event"; narratorId: string; event: unknown }
+	| {
+			type: "orchestration_observation";
+			narratorId: string;
+			observation: OrchestrationLiveObservation;
+			parentToolUseId?: string;
+	  }
 	| { type: "permission_request"; narratorId: string; request: unknown }
 	| {
 			type: "danger_reflection_started";
@@ -557,6 +564,16 @@ export type NarratorServerMessage =
 			narratorId: string;
 			percentage: number;
 			isSubagent?: boolean;
+			/**
+			 * 这条占用率属于哪只子代理。
+			 *
+			 * 只出现在**发给父级的副本**上：那个副本的 `narratorId` 是父级（这是
+			 * 路由字段），因此此前它压根说不清自己讲的是哪个孩子——父级只能整条丢掉
+			 * （`useNarratorWS` 正是这么做的）。编排面板要按 worker 逐行显示上下文，
+			 * 少了这个字段就只能靠轮询。子代理自己的那份副本不带它（那里
+			 * `narratorId` 就是它自己，且 `isSubagent` 已被剥掉）。
+			 */
+			subagentNarratorId?: string;
 			promptTokens?: number;
 			contextWindow?: number;
 			isEstimated?: boolean;

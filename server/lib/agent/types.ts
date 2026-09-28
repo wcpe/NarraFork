@@ -7,6 +7,7 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type { OrchestrationLiveIdentity } from "@shared/orchestration-live";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
@@ -423,7 +424,7 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 
 // === Agent events (yielded by the loop) ===
 
-export type AgentEvent =
+type AgentEventPayload =
 	| {
 			type: "assistant_message";
 			/** False when an errored/truncated response is retained for already-started tools. */
@@ -777,6 +778,8 @@ export type AgentEvent =
 			provider: string;
 			model: string;
 			credentialId?: string;
+			orchestrationRunId?: string | null;
+			role?: import("@shared/orchestration-observability").OrchestrationRequestRole;
 			referencePricingSnapshot?: ReferencePricingSnapshot;
 	  }
 	| {
@@ -793,7 +796,13 @@ export type AgentEvent =
 				cacheCreationInputTokens?: number;
 				cacheCreation5mTokens?: number;
 				cacheCreation1hTokens?: number;
+				contextWindow?: number;
 			};
+			promptTokens?: number;
+			contextWindow?: number;
+			inputTokenSemantics?: import("@shared/orchestration-observability").OrchestrationInputTokenSemantics;
+			usageSource?: import("@shared/orchestration-observability").OrchestrationUsageSource;
+			contextSource?: import("@shared/orchestration-observability").OrchestrationContextSource;
 			ttftMs?: number;
 			durationMs?: number;
 			contextPercent?: number;
@@ -813,6 +822,11 @@ export type AgentEvent =
 	  }
 	| { type: "silent_disconnect" }
 	| { type: "done" };
+
+/** AgentEvent 的附加编排身份，沿用旧事件并保持字段可选。 */
+export type AgentEvent = AgentEventPayload & {
+	orchestration?: OrchestrationLiveIdentity;
+};
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
@@ -954,6 +968,10 @@ export interface AgentConfig {
 	runtimePolicy?: RuntimePolicy;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
+	/** 当前编排运行的实时身份；缺失时保持旧会话语义。 */
+	orchestration?: OrchestrationLiveIdentity;
+	/** 当前请求的编排角色；主编制者请求为 orchestrator。 */
+	requestRole?: import("@shared/orchestration-observability").OrchestrationRequestRole;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
 	parentToolUseId?: string;
 	/** Stable file-change provenance segment inherited by this run. */

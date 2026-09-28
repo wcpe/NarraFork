@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type { OrchestrationLiveObservation } from "@shared/orchestration-live";
 import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
@@ -230,6 +231,13 @@ export type NarraForkEvent =
 			narratorId: string;
 			parentNarratorId: string;
 			extracted?: boolean;
+	  }
+	// 编排实时观测
+	| {
+			type: "narrator:orchestration_observation";
+			narratorId: string;
+			parentNarratorId: string;
+			observation: OrchestrationLiveObservation;
 	  }
 	// Narrator subagent
 	| {

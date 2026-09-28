@@ -1,8 +1,9 @@
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
+import type { OrchestrationLiveIdentity } from "@shared/orchestration-live";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, narratorToolCalls } from "../db/schema";
+import { backgroundTasks, narrators, narratorToolCalls, orchestrationRuns } from "../db/schema";
 import {
 	createOptionalExecutionTimeout,
 	normalizeOptionalExecutionTimeout,
@@ -25,6 +26,15 @@ import {
 	resolveSubagentModelSelectionFromPolicy,
 } from "../lib/narrator-custom-traits";
 import { getSubagentType, hasTrait, isSubagentVariant, parseTraits } from "../lib/narrator-utils";
+import { finishOrchestrationRun, type OrchestrationRunHandle } from "../lib/orchestration/audit";
+import {
+	bindOrchestrationWorker,
+	inferOrchestrationIdentity,
+	nextOrchestrationObservation,
+	releaseOrchestrationLiveRun,
+	resolveOrchestrationLiveIdentity,
+} from "../lib/orchestration/live";
+import { buildOrchestrationWorkerDefinition } from "../lib/orchestration/tier-definition";
 import type { Locale } from "../lib/prompt-i18n";
 import {
 	expandAllowedPoolForDisplay,
@@ -34,7 +44,7 @@ import {
 	settings,
 } from "../lib/settings";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import type { RuntimeForegroundControl } from "./agent-runtime/input";
 import {
 	createRuntimeMapView,
@@ -53,7 +63,7 @@ import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { backgroundTaskService, getBackgroundTaskTerminalVersion } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
-import { customSubagentService } from "./custom-subagent-service";
+import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
 import { getSubagentResultMessageId } from "./narrator-session";
 import { withNarratorStartAdmission, withNarratorWorkAdmission } from "./narrator-session-state";
@@ -103,6 +113,35 @@ import { tryAcquireFinalUpdateExecution, type UpdateExecutionLease } from "./upd
 
 /** Default wall-clock execution time for background Agent tasks (5 hours). */
 export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
+
+/** 发送 runner 侧的有界编排观测，不携带正文或流式 chunk。 */
+function broadcastRunnerObservation(
+	identity: OrchestrationLiveIdentity | undefined,
+	input: {
+		phase: import("@shared/orchestration-live").OrchestrationLivePhase;
+		source: import("@shared/orchestration-live").OrchestrationLiveSource;
+		details?: Record<string, string | number | boolean | null>;
+	},
+): void {
+	if (!identity) return;
+	const observation = nextOrchestrationObservation(identity, input);
+	if (!observation) return;
+	const parentMessage: NarratorServerMessage = {
+		type: "orchestration_observation",
+		narratorId: identity.coordinatorNarratorId,
+		observation,
+		...(identity.parentToolUseId ? { parentToolUseId: identity.parentToolUseId } : {}),
+	};
+	broadcastToNarrator(identity.coordinatorNarratorId, parentMessage);
+	if (identity.workerNarratorId && identity.workerNarratorId !== identity.coordinatorNarratorId) {
+		const { coordinatorNarratorId: _coordinatorNarratorId, ...selfObservation } = observation;
+		broadcastToNarrator(identity.workerNarratorId, {
+			type: "orchestration_observation",
+			narratorId: identity.workerNarratorId,
+			observation: selfObservation,
+		});
+	}
+}
 
 /** Stable Agent tool result emitted once a background runner is mounted. */
 export function buildBackgroundAgentStartOutput(taskIdOrAlias: string): string {
@@ -887,16 +926,28 @@ export function broadcastSubagentStarted(
 export async function executeBackgroundTask(
 	opts: SubagentExecOptions & { toolCallBinding?: ToolCallBinding },
 ): Promise<void> {
-	const launch = await withNarratorStartAdmission(opts.narratorId, async () => {
-		const owner = claimSubagentExecution(opts.narratorId);
-		const wakePolicy = { allowInboxWake: false };
-		return {
-			completion: withNarratorWorkAdmission(opts.narratorId, () =>
-				executeBackgroundTaskUnlocked(opts, owner, wakePolicy),
-			).finally(() => releaseSubagentPublicationOwner(owner, wakePolicy.allowInboxWake)),
-		};
-	});
-	return launch.completion;
+	try {
+		const launch = await withNarratorStartAdmission(opts.narratorId, async () => {
+			const owner = claimSubagentExecution(opts.narratorId);
+			const wakePolicy = { allowInboxWake: false };
+			return {
+				completion: withNarratorWorkAdmission(opts.narratorId, () =>
+					executeBackgroundTaskUnlocked(opts, owner, wakePolicy),
+				).finally(() => releaseSubagentPublicationOwner(owner, wakePolicy.allowInboxWake)),
+			};
+		});
+		return await launch.completion;
+	} catch (err) {
+		if (opts.orchestrationRun) {
+			await finishOrchestrationRun(opts.orchestrationRun, {
+				phase: "failed",
+				workerNarratorId: opts.narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		if (opts.orchestration?.runId) releaseOrchestrationLiveRun(opts.orchestration.runId);
+		throw err;
+	}
 }
 
 function releaseSubagentPublicationOwner(owner: ExecutionOwner, allowInboxWake: boolean): void {
@@ -919,6 +970,39 @@ function releaseSubagentPublicationOwner(owner: ExecutionOwner, allowInboxWake: 
 		);
 }
 
+/**
+ * 停放一个刚跑完的前台编排 worker（编排模式阶段 4b）。
+ *
+ * **必须在执行租约归还之后调用。** 停放判定的第一步是 `isNarratorRuntimeBusy`，
+ * 而"执行租约仍挂在自己名下"（`executionAdmissions.has` → `getExecutionOwner` 非空）
+ * 就算"还在跑"。曾经的挂载点是 `finalizeSubagent`，那一刻租约尚未归还，
+ * 于是每一次前台派发都被判忙、worker 永远进不了停放池，
+ * `claimReusableWorker` 永远返回 undefined——整条复用路径是死代码。
+ *
+ * 这里只做转发：能不能停全部由 parking 模块自己判断（非编排 worker、后台模式、
+ * 未消费的 mailbox、仍在 working/waiting 都会被拒绝；复核者 `orch-review--`
+ * 在类型解析这一步就被拒绝）。停放是优化而不是任务的一部分，
+ * 所以这里吞掉一切异常，绝不让一次成功的派发因为停放失败而失败。
+ *
+ * 两个调用点都是"租约归还之后"：前台首派的 `releaseForegroundLease`，以及
+ * 续跑/复用路径的 `releaseContinuationLease`。后者少挂过一次，于是被复用过的 worker
+ * 停在 `idle` 不回池，复用隔次才生效。
+ */
+async function parkCompletedForegroundWorker(
+	subagentId: string,
+	parentNarratorId: string,
+): Promise<void> {
+	try {
+		const { parkCompletedOrchestrationWorker } = await import("@server/lib/orchestration/parking");
+		await parkCompletedOrchestrationWorker({ narratorId: subagentId, parentNarratorId });
+	} catch (err) {
+		logger.warn("Failed to park a completed orchestration worker", {
+			subagentId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 /** Reject before installing runner controls or entering error-to-publication handling. */
 function claimSubagentExecution(narratorId: string): ExecutionOwner {
 	const owner = tryClaimExecution(narratorId, "subagent");
@@ -937,7 +1021,20 @@ async function executeBackgroundTaskUnlocked(
 	const pub = getRuntimePublicationService();
 	const publicationRun = await pub.getAgentRun(narratorId, parentNarratorId);
 	const backgroundAbortController = getBackgroundAbortControllers().get(narratorId);
+	const liveOrchestration =
+		opts.orchestration ??
+		resolveOrchestrationLiveIdentity({
+			workerNarratorId: narratorId,
+			coordinatorNarratorId: parentNarratorId,
+			parentToolUseId: toolUseId,
+			subagentType: opts.subagentType,
+		});
 	const executionStartedAt = Date.now();
+	broadcastRunnerObservation(liveOrchestration, {
+		phase: "worker_start",
+		source: "runner",
+		details: { event: "start", background: true },
+	});
 	const {
 		remainingTimeoutMs: timeoutMs,
 		timeoutLabelMs,
@@ -976,6 +1073,19 @@ async function executeBackgroundTaskUnlocked(
 	executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
 	if (executionTimeout?.signal.aborted) onTimeout();
 	let finalUserId: string | null = opts.userId ?? null;
+	let backgroundAuditFinished = false;
+	const finishBackgroundAudit = async (input: {
+		phase: "dispatched" | "failed";
+		error?: string;
+	}): Promise<void> => {
+		if (backgroundAuditFinished) return;
+		backgroundAuditFinished = true;
+		await finishOrchestrationRun(opts.orchestrationRun ?? null, {
+			phase: input.phase,
+			workerNarratorId: narratorId,
+			error: input.error,
+		});
+	};
 
 	try {
 		const execution = await establishSubagentExecutionSegment({
@@ -1016,7 +1126,14 @@ async function executeBackgroundTaskUnlocked(
 		});
 		const hasError = outcome !== "completed";
 
-		if ((await isBackgroundTaskCancelled(narratorId)) || !owner.isCurrent()) return;
+		if (await isBackgroundTaskCancelled(narratorId)) {
+			await finishBackgroundAudit({ phase: "failed", error: "cancelled" });
+			return;
+		}
+		if (!owner.isCurrent()) {
+			await finishBackgroundAudit({ phase: "failed", error: "execution owner changed" });
+			return;
+		}
 
 		// Background takeover: the user claimed this task's result. Do NOT
 		// finalize/notify as completed/failed — transition to the idle takeover
@@ -1039,6 +1156,7 @@ async function executeBackgroundTaskUnlocked(
 					toolUseId,
 					backgroundAbortController,
 				);
+				await finishBackgroundAudit({ phase: "failed", error: "taken_over" });
 				return;
 			}
 		}
@@ -1066,9 +1184,25 @@ async function executeBackgroundTaskUnlocked(
 			false,
 			finalUserId,
 		);
+		await finishBackgroundAudit({
+			phase: hasError ? "failed" : "dispatched",
+			...(hasError ? { error: finalText } : {}),
+		});
+		broadcastRunnerObservation(liveOrchestration, {
+			phase: "terminal",
+			source: "runner",
+			details: { event: "end", status: outcome },
+		});
 	} catch (err) {
 		wakePolicy.allowInboxWake = false;
-		if ((await isBackgroundTaskCancelled(narratorId)) || !owner.isCurrent()) return;
+		if (await isBackgroundTaskCancelled(narratorId)) {
+			await finishBackgroundAudit({ phase: "failed", error: "cancelled" });
+			return;
+		}
+		if (!owner.isCurrent()) {
+			await finishBackgroundAudit({ phase: "failed", error: "execution owner changed" });
+			return;
+		}
 
 		// Background takeover during execution — same as above, including the
 		// already-released case.
@@ -1082,6 +1216,7 @@ async function executeBackgroundTaskUnlocked(
 					toolUseId,
 					backgroundAbortController,
 				);
+				await finishBackgroundAudit({ phase: "failed", error: "taken_over" });
 				return;
 			}
 		}
@@ -1102,7 +1237,10 @@ async function executeBackgroundTaskUnlocked(
 			timedOut,
 			owner,
 		});
-		if (!owner.isCurrent()) return;
+		if (!owner.isCurrent()) {
+			await finishBackgroundAudit({ phase: "failed", error: "execution owner changed" });
+			return;
+		}
 		await finalizeBackgroundCompletion(
 			narratorId,
 			parentNarratorId,
@@ -1115,7 +1253,19 @@ async function executeBackgroundTaskUnlocked(
 			false,
 			finalUserId,
 		);
+		await finishBackgroundAudit({ phase: "failed", error: errorText });
+		broadcastRunnerObservation(liveOrchestration, {
+			phase: "terminal",
+			source: "runner",
+			details: { event: "end", status: timedOut ? "timeout" : "failed" },
+		});
 	} finally {
+		if (!backgroundAuditFinished) {
+			await finishBackgroundAudit({
+				phase: "failed",
+				error: "background task ended without terminal state",
+			});
+		}
 		executionTimeout?.signal.removeEventListener("abort", onTimeout);
 		executionTimeout?.dispose();
 		unregisterRunningExecution();
@@ -1141,6 +1291,7 @@ async function executeBackgroundTaskUnlocked(
 			getAttachWaitersMap().delete(narratorId);
 		}
 		updateLease?.release();
+		if (liveOrchestration?.runId) releaseOrchestrationLiveRun(liveOrchestration.runId);
 	}
 }
 
@@ -1190,6 +1341,27 @@ export async function cancelBackgroundTask(taskNarratorId: string): Promise<bool
 		getBackgroundAbortControllers().delete(taskNarratorId);
 	}
 	await backgroundTaskService.markCancelled(taskNarratorId, ctrl).catch(() => {});
+	const task = await db
+		.select({ orchestrationRunId: backgroundTasks.orchestrationRunId })
+		.from(backgroundTasks)
+		.where(eq(backgroundTasks.id, taskNarratorId))
+		.limit(1)
+		.get();
+	if (task?.orchestrationRunId) {
+		const run = await db
+			.select({ id: orchestrationRuns.id, startedAt: orchestrationRuns.startedAt })
+			.from(orchestrationRuns)
+			.where(eq(orchestrationRuns.id, task.orchestrationRunId))
+			.limit(1)
+			.get();
+		if (run) {
+			await finishOrchestrationRun(
+				{ id: run.id, startedAt: run.startedAt },
+				{ phase: "failed", workerNarratorId: taskNarratorId, error: "cancelled" },
+			);
+			releaseOrchestrationLiveRun(run.id);
+		}
+	}
 	return true;
 }
 
@@ -1288,6 +1460,8 @@ interface ForegroundLoopInput {
 	bindingNarratorId?: string;
 	fileChangeStartedAt?: string;
 	deferCompletionPublication?: boolean;
+	/** 当前编排运行身份。 */
+	orchestration?: OrchestrationLiveIdentity;
 	prePromptBashCommand?: string;
 	publicationRun?: PublicationRun;
 	subagentId: string;
@@ -1407,6 +1581,14 @@ function startForegroundRunUnlocked(
 		rebuildSystemPrompt,
 		updateLease,
 	} = input;
+	const liveOrchestration =
+		(input.orchestration && bindOrchestrationWorker(input.orchestration, subagentId)) ??
+		resolveOrchestrationLiveIdentity({
+			workerNarratorId: subagentId,
+			coordinatorNarratorId: parentNarratorId,
+			parentToolUseId: toolUseId,
+			subagentType,
+		});
 
 	let finalText = "";
 	let hasError = false;
@@ -1422,6 +1604,18 @@ function startForegroundRunUnlocked(
 	const executionStartedAt = Date.now();
 	const fileChangeStartedAt =
 		input.fileChangeStartedAt ?? new Date(executionStartedAt).toISOString();
+	broadcastRunnerObservation(liveOrchestration, {
+		phase: "worker_start",
+		source: "runner",
+		details: { event: "start", background: false },
+	});
+	if (liveOrchestration?.workerRole === "reviewer") {
+		broadcastRunnerObservation(liveOrchestration, {
+			phase: "review",
+			source: "review",
+			details: { event: "start", reviewKind: "independent" },
+		});
+	}
 	const { remainingTimeoutMs, timeoutLabelMs, executionDeadlineAt, expiredAtMount } =
 		resolveSubagentExecutionTiming({
 			now: executionStartedAt,
@@ -1480,6 +1674,18 @@ function startForegroundRunUnlocked(
 		resolveForeground({ kind: "handoff", runId, output });
 		return true;
 	};
+	/**
+	 * 归还本次前台运行的执行租约，并顺势停放已经跑完的编排 worker。
+	 *
+	 * 两件事必须成对、且顺序不可颠倒：停放的可用性判定把"执行租约还挂在自己手上"
+	 * 算作"还在跑"（见 `parkCompletedForegroundWorker`）。把所有归还点都收敛到这一个
+	 * 函数上，是为了让"还了租约"与"尝试停放"不可能被后人改散——
+	 * 散开写正是这个缺陷原来的成因。
+	 */
+	const releaseForegroundLease = async (allowInboxWakeForLease: boolean): Promise<void> => {
+		releaseSubagentPublicationOwner(owner, allowInboxWakeForLease);
+		await parkCompletedForegroundWorker(subagentId, parentNarratorId);
+	};
 	const publishTerminal = async (
 		terminal: Omit<ForegroundRunTerminal, "runId" | "allowInboxWake">,
 	): Promise<boolean> => {
@@ -1499,7 +1705,32 @@ function startForegroundRunUnlocked(
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
-			releaseSubagentPublicationOwner(owner, allowInboxWake);
+			await releaseForegroundLease(allowInboxWake);
+		}
+		broadcastRunnerObservation(liveOrchestration, {
+			phase: "terminal",
+			source: "runner",
+			details: {
+				event: "end",
+				status: terminal.hasError
+					? "failed"
+					: terminal.interrupted
+						? "interrupted"
+						: terminal.timedOut
+							? "timeout"
+							: "completed",
+			},
+		});
+		if (liveOrchestration?.workerRole === "reviewer") {
+			broadcastRunnerObservation(liveOrchestration, {
+				phase: "review",
+				source: "review",
+				details: {
+					event: "end",
+					reviewKind: "independent",
+					status: terminal.hasError ? "failed" : "completed",
+				},
+			});
 		}
 		const publication: ForegroundRunTerminal = { runId, allowInboxWake, ...terminal };
 		resolveTerminal(publication);
@@ -1568,6 +1799,7 @@ function startForegroundRunUnlocked(
 					parentNarratorId,
 					toolUseId,
 					subagentType,
+					orchestration: liveOrchestration,
 					prompt: currentPrompt,
 					cwd,
 					model: currentModel,
@@ -1826,7 +2058,7 @@ function startForegroundRunUnlocked(
 		allowInboxWake = false;
 		if (publicationCommitError) {
 			terminalPublished = true;
-			if (releaseOnTerminal) releaseSubagentPublicationOwner(owner, false);
+			if (releaseOnTerminal) await releaseForegroundLease(false);
 			rejectTerminal(err);
 			if (!foregroundPublished) rejectForeground(err);
 			return;
@@ -1881,6 +2113,10 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 // === Subagent runner ===
 
 export interface RunSubagentInput {
+	/** 当前编排运行身份；复核者缺省时由类型与父级派发解析。 */
+	orchestration?: OrchestrationLiveIdentity;
+	/** 当前编排审计句柄；后台任务沿用父派发的同一行。 */
+	orchestrationRun?: OrchestrationRunHandle | null;
 	/** Exact spawning Agent attempt, supplied by executeTool, never resolved by provider id. */
 	toolCallBinding?: ToolCallBinding;
 	parentNarratorId: string;
@@ -1907,6 +2143,14 @@ export interface RunSubagentInput {
 	userId?: string | null;
 	/** Existing tool/coordinator lease; tool leases are transferred into the runner lifecycle. */
 	updateExecutionLease?: SubagentUpdateExecutionLease;
+	/**
+	 * 服务端解析好的子代理定义（编排档位定义走这里）。
+	 *
+	 * 显式传入优先于按名字查自定义子代理：编排 worker 的类型编码
+	 * （`orch--<profileId>--<tier>`）在磁盘上没有对应文件，按名字查只会得到 null，
+	 * 那样 medium/heavy 的执行者会被 fail closed 成只读。
+	 */
+	customDefinition?: CustomSubagentDef | null;
 }
 
 /**
@@ -1921,6 +2165,13 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 }
 
 async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
+	const orchestrationIdentity =
+		input.orchestration ??
+		inferOrchestrationIdentity({
+			coordinatorNarratorId: input.parentNarratorId,
+			parentToolUseId: input.toolUseId,
+			subagentType: input.subagentType,
+		});
 	const {
 		parentNarratorId,
 		toolUseId,
@@ -1948,7 +2199,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentType === "search" ||
 		subagentType === "review" ||
 		subagentType === "general";
-	const customDef = isBuiltin ? null : await customSubagentService.loadByName(subagentType);
+	// 优先级：调用方显式传入 > 编排档位编码反解 > 按名字查自定义子代理。
+	// 中间这一步是必需的：编排 worker 的类型在磁盘上没有对应文件，按名字查必然
+	// 得到 null，而 null 会让 policy 把 medium/heavy 的执行者 fail closed 成只读。
+	const customDef =
+		input.customDefinition ??
+		buildOrchestrationWorkerDefinition(subagentType, locale as Locale) ??
+		(isBuiltin ? null : await customSubagentService.loadByName(subagentType));
 
 	const rebuildSystemPrompt = (contextSummary?: string | null) =>
 		buildSubagentSystemPrompt(
@@ -2071,6 +2328,9 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	}
 
 	const subagentId = subagent.id;
+	const workerOrchestration = orchestrationIdentity
+		? bindOrchestrationWorker(orchestrationIdentity, subagentId, orchestrationIdentity.workerRole)
+		: undefined;
 	updateLease.setNarratorId(subagentId);
 	const {
 		model,
@@ -2146,6 +2406,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			await cancelBackgroundTask(subagentId).catch(() => {});
 			updateLease.release();
 		};
+		const backgroundOrchestration = workerOrchestration;
 		try {
 			// --- Background mode: fire-and-forget ---
 
@@ -2191,6 +2452,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				parentNarratorId,
 				subagentNarratorId: subagentId,
 				subagentType,
+				orchestrationRunId: backgroundOrchestration?.runId ?? null,
 				toolUseId,
 				alias: aliasRegistration.alias,
 				title,
@@ -2224,6 +2486,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 					parentNarratorId,
 					toolUseId,
 					subagentType,
+					orchestration: backgroundOrchestration,
+					orchestrationRun: input.orchestrationRun ?? null,
 					prompt,
 					cwd,
 					model,
@@ -2276,6 +2540,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		parentNarratorId,
 		toolUseId,
 		subagentType,
+		orchestration: workerOrchestration,
 		prompt,
 		cwd,
 		model,
@@ -2309,6 +2574,8 @@ export interface ContinueSubagentInput {
 	bindingToolUseId?: string;
 	bindingNarratorId?: string;
 	fileChangeStartedAt?: string;
+	/** 续跑时沿用的编排身份；缺省从 worker 登记簿恢复。 */
+	orchestration?: OrchestrationLiveIdentity;
 	mailboxInput?: boolean;
 	/** The resume adapter owns the final exact-origin publication chain. */
 	deferPublicationRelease?: boolean;
@@ -2363,8 +2630,14 @@ export interface ContinueSubagentInput {
 }
 
 export interface StartedSubagentContinuation {
-	/** Idempotent release after the caller's exact-origin publication has settled. */
-	releasePublication?: () => void;
+	/**
+	 * Idempotent release after the caller's exact-origin publication has settled.
+	 *
+	 * Resolves once the release has also attempted to park the worker. Parking happens
+	 * strictly after the execution lease is given back, so awaiting this promise is what
+	 * makes "the worker is back in the pool" observable to the caller (and to tests).
+	 */
+	releasePublication?: () => Promise<void>;
 	runId: string;
 	/** Legacy foreground boundary: may settle with a detach handoff. */
 	completion: Promise<string>;
@@ -2498,6 +2771,22 @@ async function startContinuedSubagentUnlocked(
 	const priorTaskVersion = getBackgroundTaskTerminalVersion(priorTask);
 
 	const subagentType = getSubagentType(original.variant) ?? original.subagentType ?? "general";
+	const continuationOrchestration =
+		input.orchestration ??
+		resolveOrchestrationLiveIdentity({
+			workerNarratorId: subagentId,
+			coordinatorNarratorId: parentNarratorId,
+			parentToolUseId: input.toolUseId,
+			subagentType,
+		});
+	const isSelfReview = input.skipConclusionDelivery === true && input.preserveBackground !== true;
+	if (isSelfReview) {
+		broadcastRunnerObservation(continuationOrchestration, {
+			phase: "review",
+			source: "review",
+			details: { event: "start", reviewKind: "self" },
+		});
+	}
 	const {
 		model,
 		reasoningEffort: fixedPoolEffort,
@@ -2510,7 +2799,11 @@ async function startContinuedSubagentUnlocked(
 	// Load custom subagent definition once for non-builtin types
 	const isBuiltinContinue =
 		subagentType === "explore" || subagentType === "plan" || subagentType === "general";
-	const customDef = isBuiltinContinue ? null : await customSubagentService.loadByName(subagentType);
+	// 同 runSubagentUnlocked：续跑的 worker 只剩 subagentType 可依，
+	// 编排档位必须能从这里还原出工具等级，否则"首次可写、续跑只读"。
+	const customDef =
+		buildOrchestrationWorkerDefinition(subagentType, locale as Locale) ??
+		(isBuiltinContinue ? null : await customSubagentService.loadByName(subagentType));
 	const rebuildSystemPrompt = (contextSummary?: string | null) =>
 		buildSubagentSystemPrompt(
 			subagentType,
@@ -2693,6 +2986,7 @@ async function startContinuedSubagentUnlocked(
 				parentNarratorId,
 				toolUseId,
 				subagentType,
+				orchestration: continuationOrchestration,
 				prompt: currentInput,
 				cwd,
 				model,
@@ -2750,9 +3044,47 @@ async function startContinuedSubagentUnlocked(
 	 */
 	let pendingAnnouncement: ResumedBackgroundTaskAnnouncement | undefined;
 	let allowInboxWake = false;
+	/**
+	 * 归还续跑（复用）路径的执行租约，并顺势停放已经跑完的编排 worker。
+	 *
+	 * 与前台首派路径的 `releaseForegroundLease` 是同一件事的两个出口，同样必须成对、
+	 * 顺序不可颠倒：停放判定的第一步把"执行租约还挂在自己手上"算作"还在跑"。
+	 *
+	 * 两条路径互斥且**只可能有一条真正执行**：复用时 `startForegroundRun` 拿到的是借来的
+	 * owner，`releaseOnTerminal` 因此为 false，那条 `releaseForegroundLease` 永远不会被走到，
+	 * 租约改由调用方（`subagent-resume.ts` 的续跑释放出口）在结论落定后归还。
+	 * 因此这里和那里各挂一次不会重复停放；反过来，少了这里这一步的后果是：
+	 * worker 被复用一次后停在 `idle` 不回池，下一次同档派发只能新建——
+	 * "复用"隔次生效，本可以省下的提示词前缀缓存收益少一半。
+	 *
+	 * 两个归还出口（deferred 的 `releasePublication` 与非 deferred 的终态 finally）
+	 * 同样收敛到这一个函数上，理由与前台路径相同：散开写正是这个缺陷原来的成因。
+	 */
+	const releaseContinuationLease = async (): Promise<void> => {
+		if (executionOwner?.isCurrent()) {
+			if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
+			releaseSubagentPublicationOwner(executionOwner, allowInboxWake);
+		}
+		await parkCompletedForegroundWorker(subagentId, parentNarratorId);
+	};
 	const terminalCompletion = run.terminal
 		.then(async (terminal) => {
 			allowInboxWake = terminal.allowInboxWake;
+			if (isSelfReview) {
+				broadcastRunnerObservation(continuationOrchestration, {
+					phase: "review",
+					source: "review",
+					details: {
+						event: "end",
+						reviewKind: "self",
+						status: terminal.hasError
+							? "failed"
+							: terminal.interrupted
+								? "interrupted"
+								: "completed",
+					},
+				});
+			}
 			if (!executionOwner?.isCurrent()) return terminal.output;
 			if (input.preserveBackground) {
 				await finalizeBackgroundCompletion(
@@ -2829,17 +3161,11 @@ async function startContinuedSubagentUnlocked(
 				if (!input.deferPublicationRelease && priorTaskVersion && executionOwner?.isCurrent())
 					backgroundTaskService.endAgentContinuation(subagentId);
 			} finally {
-				if (!input.deferPublicationRelease && executionOwner)
-					releaseSubagentPublicationOwner(executionOwner, allowInboxWake);
+				if (!input.deferPublicationRelease && executionOwner) await releaseContinuationLease();
 			}
 		});
 	return {
-		releasePublication: () => {
-			if (executionOwner?.isCurrent()) {
-				if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
-				releaseSubagentPublicationOwner(executionOwner, allowInboxWake);
-			}
-		},
+		releasePublication: releaseContinuationLease,
 		runId: run.runId,
 		completion: run.foreground.then((publication) =>
 			publication.kind === "terminal" ? terminalCompletion : publication.output,
