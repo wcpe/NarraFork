@@ -26,11 +26,17 @@ export interface FileTreePanelProps {
 	narratorId: string;
 	/** Open a file in the read-only viewer panel. */
 	onOpenFile: (absolutePath: string, fileName: string) => void;
-	/** Include dotfiles. */
+	/**
+	 * Include dotfiles.
+	 *
+	 * 默认为 true —— 文件树是叙述者查看/打开项目文件的入口, 隐藏 `.env`、
+	 * `.gitignore`、`.config/` 这些恰恰是最常被讨论的文件, 会让用户在树里
+	 * "找不到"一个明明存在的路径。调用方仍可显式传 false 关掉。
+	 */
 	showHidden?: boolean;
 }
 
-export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: FileTreePanelProps) {
+export function FileTreePanel({ narratorId, onOpenFile, showHidden = true }: FileTreePanelProps) {
 	const { t } = useTranslation("narrator");
 	const contextQuery = useWorkspaceContext(narratorId);
 	const context = contextQuery.data;

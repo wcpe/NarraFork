@@ -21,7 +21,7 @@
  */
 
 import { Z } from "@frontend/lib/z-index";
-import { ActionIcon, Box, CopyButton, Group, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Group, Tooltip } from "@mantine/core";
 import {
 	IconArrowBarToUp,
 	IconArrowsMaximize,
@@ -34,6 +34,7 @@ import {
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { useClipboard } from "../../../hooks/useClipboard";
 import { DocumentCopyButton } from "../content/DocumentCopyButton";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { isMarkdownTarget } from "./vlist-content-view-body";
@@ -143,6 +144,10 @@ export function VListContentViewActions({
 }: VListContentViewActionsProps) {
 	const { t } = useTranslation("common");
 	const { t: tNarrator } = useTranslation("narrator");
+	// 项目级复制 hook: 优先 navigator.clipboard, 非安全上下文(HTTP)回退到
+	// execCommand 选区方案。Mantine 的 CopyButton 只调 navigator.clipboard 且
+	// 无回退, 在 HTTP 下会静默失败。
+	const { copy, copied } = useClipboard({ timeout: 2000 });
 	// Offered only when the ROW can actually swap its body for the raw source.
 	// Flipping shell state that the row's renderer ignores would leave the reader
 	// clicking a lit-up button with nothing changing on screen — the toggle is not
@@ -234,22 +239,18 @@ export function VListContentViewActions({
 						</ActionIcon>
 					</Tooltip>
 				) : (
-					<CopyButton value={target.text}>
-						{({ copied, copy }) => (
-							<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
-								<ActionIcon
-									size={BUTTON_SIZE}
-									variant="filled"
-									color={copied ? "teal" : "gray"}
-									onClick={copy}
-									aria-label={copied ? t("copied") : t("copy")}
-									style={buttonStyle}
-								>
-									<IconCopy size={ICON_SIZE} />
-								</ActionIcon>
-							</Tooltip>
-						)}
-					</CopyButton>
+					<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
+						<ActionIcon
+							size={BUTTON_SIZE}
+							variant="filled"
+							color={copied ? "teal" : "gray"}
+							onClick={() => copy(target.text)}
+							aria-label={copied ? t("copied") : t("copy")}
+							style={buttonStyle}
+						>
+							<IconCopy size={ICON_SIZE} />
+						</ActionIcon>
+					</Tooltip>
 				)}
 				<Tooltip label={t("fullscreen")} withArrow position="top">
 					<ActionIcon

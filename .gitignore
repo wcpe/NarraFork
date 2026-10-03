@@ -31,6 +31,8 @@ analyze/
 analyze2/
 .perf-analysis/
 .narrafork/
+# AI 协作产生的临时草稿、中间脚本与过程性笔记（见 AGENTS.md 工作目录约定）
+.tmp/
 .idea/
 
 *.heapsnapshot

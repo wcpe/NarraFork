@@ -513,8 +513,9 @@ export const forkNarratorSchema = z
 		title: z.string().min(1).max(200).optional(),
 		inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
 	})
-	.refine((data) => !!(data.forkMessageUuid || data.forkMessageId), {
-		message: "forkMessageId or forkMessageUuid is required",
+	.refine((data) => !!(data.forkMessageUuid || data.forkMessageId) || data.inheritMode === "full", {
+		// 无 fork 点时只允许整会话克隆(inheritMode=full): 列表卡片的「分叉」入口即此语义。
+		message: "forkMessageId or forkMessageUuid is required (or inheritMode must be full)",
 	});
 
 /**

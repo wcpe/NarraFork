@@ -5477,6 +5477,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid ?? null, {
 		title: parsed.data.title,
 		userId: c.get("user").sub,
+		// 无 fork 点时按整会话克隆; 显式带 fork 点时沿用调用方指定的继承模式(默认 full)。
 		inheritMode: parsed.data.inheritMode ?? "full",
 		forkMessageId: parsed.data.forkMessageId,
 		standalone: true,

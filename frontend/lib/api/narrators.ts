@@ -2012,6 +2012,7 @@ export const narratorsApi = {
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.
+	// forkMessageId 为空串/省略时克隆整段会话(后端 inheritMode 默认 full)。
 	forkNarrator: (
 		narratorId: string,
 		forkMessageId: string,
@@ -2020,7 +2021,7 @@ export const narratorsApi = {
 	) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork`, {
 			method: "POST",
-			body: JSON.stringify({ forkMessageId, title, inheritMode }),
+			body: JSON.stringify({ forkMessageId: forkMessageId || undefined, title, inheritMode }),
 		}),
 	startAskInPassing: (
 		narratorId: string,

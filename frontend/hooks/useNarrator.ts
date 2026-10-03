@@ -596,10 +596,11 @@ export function useForkNarrator() {
 			inheritMode,
 		}: {
 			narratorId: string;
-			forkMessageId: string;
+			/** 留空则克隆整段会话(后端 inheritMode 默认 full); 否则从指定消息处分叉。 */
+			forkMessageId?: string | null;
 			title?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
-		}) => api.forkNarrator(narratorId, forkMessageId, title, inheritMode),
+		}) => api.forkNarrator(narratorId, forkMessageId ?? "", title, inheritMode),
 		onSuccess: () => {
 			// 只让 narrator 列表失效, 避免误伤 narrator 详情/预览/工具调用等子资源查询
 			qc.invalidateQueries({

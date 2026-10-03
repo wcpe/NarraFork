@@ -1,10 +1,12 @@
 import { Button, Group, Loader, Modal, Stack, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { CreateNarratorResult } from "../../components/narrator/CreateNarratorModal";
+import { NarratorForkModal } from "../../components/narrator/list/NarratorForkModal";
 import {
 	NarratorListCard,
 	type NarratorListItem,
@@ -26,7 +28,11 @@ import {
 	validateNarratorListSearch,
 } from "../../components/narrator/list/narrator-list-utils";
 import { useAllModels } from "../../hooks/useModels";
-import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrator";
+import {
+	useArchiveNarrator,
+	useForkNarrator,
+	useNarratorsPaginated,
+} from "../../hooks/useNarrator";
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
@@ -97,6 +103,8 @@ function NarratorsPage() {
 	const { t: tn } = useTranslation("narrator");
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
 	const [navigatingId, setNavigatingId] = useState<string | null>(null);
+	const [forkTarget, setForkTarget] = useState<NarratorListItem | null>(null);
+	const forkNarrator = useForkNarrator();
 	const qc = useQueryClient();
 	const requireSetup = useSetupWizardGuard();
 
@@ -123,6 +131,26 @@ function NarratorsPage() {
 		}
 		qc.setQueryData<NarratorsInfiniteData>(["narrators", "paginated", queryOptions], (old) => {
 			if (!old?.pages) return old;
+			// 归档时后端列表查询本身就排除 archived, 若只改 status 不移除, 之后到达的
+			// 归档广播会把 invalidateQueries 拉回的"已无该项"覆盖回"status: archived",
+			// 导致项残留在活跃列表。这里直接按归档语义移除该项。
+			//
+			// 页只换内容不删除: 无限查询的 pages 与 pageParams 必须等长, 删掉空页会让
+			// 两者错位、下次 fetchNextPage 光标错乱。空页由分页器自行跳过, 这里只清空 items。
+			if (event.status === "archived") {
+				let removed = false;
+				const pages = old.pages.map((page) => {
+					const items = page.items.filter((item) => {
+						if (item.id === narratorId) {
+							removed = true;
+							return false;
+						}
+						return true;
+					});
+					return items.length === page.items.length ? page : { ...page, items };
+				});
+				return removed ? { ...old, pages } : old;
+			}
 			let changed = false;
 			const pages = old.pages.map((page) => ({
 				...page,
@@ -249,6 +277,7 @@ function NarratorsPage() {
 							dimmed={!!navigatingId && navigatingId !== narrator.id}
 							onOpen={handleNarratorClick}
 							onArchive={setConfirmArchiveId}
+							onFork={setForkTarget}
 						/>
 					))}
 					{!localQuery.trim() && <div ref={sentinelRef} style={{ height: 1 }} />}
@@ -274,6 +303,39 @@ function NarratorsPage() {
 					<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
 				</Suspense>
 			)}
+
+			<Modal opened={!!forkTarget} onClose={() => setForkTarget(null)} title={t("fork")} centered>
+				<NarratorForkModal
+					narratorId={forkTarget?.id ?? null}
+					narratorTitle={forkTarget?.title ?? null}
+					loading={forkNarrator.isPending}
+					onClose={() => setForkTarget(null)}
+					onConfirm={(narratorId, title) => {
+						forkNarrator.mutate(
+							{ narratorId, forkMessageId: null, inheritMode: "full", title },
+							{
+								onSuccess: (newNarrator: { id: string }) => {
+									setForkTarget(null);
+									notifications.show({
+										color: "teal",
+										message: t("forkSuccess"),
+									});
+									navigate({
+										to: "/narrators/$narratorId",
+										params: { narratorId: newNarrator.id },
+									});
+								},
+								onError: (error: Error) => {
+									notifications.show({
+										color: "red",
+										message: t("forkFailed", { message: error.message }),
+									});
+								},
+							},
+						);
+					}}
+				/>
+			</Modal>
 
 			<Modal
 				opened={!!confirmArchiveId}

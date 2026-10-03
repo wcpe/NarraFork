@@ -24,10 +24,11 @@
 
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
-import { ActionIcon, CopyButton, Tooltip } from "@mantine/core";
+import { ActionIcon, Tooltip } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import type { CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
+import { useClipboard } from "../../../hooks/useClipboard";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { type CodeCopyPlacement, VIEW_ACTION_BAR_GAP } from "./vlist-content-view-float";
@@ -135,6 +136,10 @@ export function VListCodeCopyButton({
 	const { t } = useTranslation("common");
 	const interactive = useRenderInteractive();
 	const { alwaysVisible, barCanCover } = useTouchCopyMode();
+	// 项目级复制 hook: 优先 navigator.clipboard, 非安全上下文(HTTP)回退到
+	// execCommand 选区方案。Mantine 的 CopyButton 只调 navigator.clipboard 且
+	// 无回退, 在 HTTP 下会静默失败。
+	const { copy, copied } = useClipboard({ timeout: 2000 });
 	if (!interactive || value.length === 0) return null;
 	// Without the row bar in the picture, both dodges are pointless: `bottom-right`
 	// would park the button away from the panel's head for no reason, and `hidden`
@@ -169,32 +174,28 @@ export function VListCodeCopyButton({
 			data-vlist-code-copy-value={value}
 			{...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}
 		>
-			<CopyButton value={value} timeout={2000}>
-				{({ copied, copy }) => (
-					<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="left">
-						<ActionIcon
-							size={alwaysVisible ? "md" : "xs"}
-							variant="filled"
-							color={copied ? "teal" : "gray"}
-							onClick={(event) => {
-								// The tap must not also read as a tap on the BODY: its host counts two
-								// body taps as "open fullscreen" (VListContentViewHost), so copying
-								// twice in a row would have thrown the reader into the modal.
-								event.stopPropagation();
-								copy();
-							}}
-							aria-label={copied ? t("copied") : t("copy")}
-							tabIndex={isHidden ? -1 : 0}
-						>
-							{copied ? (
-								<IconCheck size={alwaysVisible ? TOUCH_ICON_SIZE : ICON_SIZE} />
-							) : (
-								<IconCopy size={alwaysVisible ? TOUCH_ICON_SIZE : ICON_SIZE} />
-							)}
-						</ActionIcon>
-					</Tooltip>
-				)}
-			</CopyButton>
+			<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="left">
+				<ActionIcon
+					size={alwaysVisible ? "md" : "xs"}
+					variant="filled"
+					color={copied ? "teal" : "gray"}
+					onClick={(event) => {
+						// The tap must not also read as a tap on the BODY: its host counts two
+						// body taps as "open fullscreen" (VListContentViewHost), so copying
+						// twice in a row would have thrown the reader into the modal.
+						event.stopPropagation();
+						copy(value);
+					}}
+					aria-label={copied ? t("copied") : t("copy")}
+					tabIndex={isHidden ? -1 : 0}
+				>
+					{copied ? (
+						<IconCheck size={alwaysVisible ? TOUCH_ICON_SIZE : ICON_SIZE} />
+					) : (
+						<IconCopy size={alwaysVisible ? TOUCH_ICON_SIZE : ICON_SIZE} />
+					)}
+				</ActionIcon>
+			</Tooltip>
 		</div>
 	);
 }

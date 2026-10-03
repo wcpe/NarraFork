@@ -13,6 +13,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconGitFork,
 	IconSubtask,
 	IconTerminal2,
 	IconTrash,
@@ -114,6 +115,7 @@ interface ActiveNarratorListCardProps extends BaseNarratorListCardProps {
 	dimmed?: boolean;
 	onOpen: (narratorId: string) => void;
 	onArchive: (narratorId: string) => void;
+	onFork?: (narrator: NarratorListItem) => void;
 }
 
 interface ArchivedNarratorListCardProps extends BaseNarratorListCardProps {
@@ -369,6 +371,7 @@ function ActiveNarratorCard({
 	dimmed,
 	onOpen,
 	onArchive,
+	onFork,
 }: ActiveNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
@@ -418,6 +421,24 @@ function ActiveNarratorCard({
 					</Group>
 					<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 						<ViewerAvatars narrator={narrator} />
+						{onFork && (
+							<Tooltip label={t("fork")}>
+								<ActionIcon
+									size="sm"
+									color="grape"
+									variant="subtle"
+									onPointerDown={(e: PointerEvent) => {
+										e.stopPropagation();
+									}}
+									onClick={(e: MouseEvent) => {
+										e.stopPropagation();
+										onFork(narrator);
+									}}
+								>
+									<IconGitFork size={16} />
+								</ActionIcon>
+							</Tooltip>
+						)}
 						<Tooltip label={t("archive")}>
 							<ActionIcon
 								size="sm"
@@ -469,6 +490,25 @@ function ActiveNarratorCard({
 							<NarratorTitle narrator={narrator} localQuery={localQuery} />
 						</Text>
 					</Group>
+					{onFork && (
+						<Tooltip label={t("fork")}>
+							<ActionIcon
+								size="sm"
+								color="grape"
+								variant="subtle"
+								style={{ flexShrink: 0 }}
+								onPointerDown={(e: PointerEvent) => {
+									e.stopPropagation();
+								}}
+								onClick={(e: MouseEvent) => {
+									e.stopPropagation();
+									onFork(narrator);
+								}}
+							>
+								<IconGitFork size={16} />
+							</ActionIcon>
+						</Tooltip>
+					)}
 					<Tooltip label={t("archive")}>
 						<ActionIcon
 							size="sm"
