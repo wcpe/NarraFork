@@ -389,10 +389,6 @@ export async function hasInboxKind(narratorId: string, kinds: MailboxKind[]): Pr
 		.limit(1)
 		.get();
 }
-/** Wake authority is separate from consumption: broadcasts remain visible to live runners. */
-export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boolean> {
-	const port = getRuntimeQueuePort();
-	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
 
 /**
  * 唤醒会**消费**的 mailbox 种类——"队列里还有没有别人等着要做的事"的权威清单。
@@ -440,6 +436,33 @@ export async function hasActionableTaskNotice(narratorId: string): Promise<boole
 }
 
 /**
+ * `WAKEABLE_INBOX_KINDS` 里是否还有**会唤醒一轮**的排队消息。
+ *
+ * 与 {@link hasInboxKind} 的区别只在广播：`agent_message` 带 `isBroadcast` 时
+ * 只是让 live runner 看得见（可 claim、已启动的一轮会读到），**不授权**叫醒一个
+ * 闲着的叙述者——所以这里必须把广播排掉。按 kind 过滤会把它算成"有活要做"，
+ * 于是纯广播队列也能唤醒一轮白烧的模型调用。
+ *
+ * 走 mailbox 端口时由适配器判定；SQLite 侧用 `json_extract` 读 `metadataJson`。
+ */
+async function hasWakeableInboxKind(narratorId: string): Promise<boolean> {
+	const port = getRuntimeQueuePort();
+	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
+	return !!db
+		.select({ id: mailbox.id })
+		.from(mailbox)
+		.where(
+			and(
+				eq(mailbox.narratorId, narratorId),
+				eq(mailbox.state, "queued"),
+				sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
+			),
+		)
+		.limit(1)
+		.get();
+}
+
+/**
  * 队列里是否还有**唤醒会消费**的东西——"还有什么在排队"这个问题在全仓唯一的答案。
  *
  * 两个调用方必须问同一个问题，且必须都走这个函数而不能各自拼查询：
@@ -449,7 +472,7 @@ export async function hasActionableTaskNotice(narratorId: string): Promise<boole
  * 所以"唤醒算得上、停放没算上"的差异就是一条消息被永久搁浅。
  */
 export async function hasWakeableInboxWork(narratorId: string): Promise<boolean> {
-	if (await hasInboxKind(narratorId, [...WAKEABLE_INBOX_KINDS])) return true;
+	if (await hasWakeableInboxKind(narratorId)) return true;
 	return await hasActionableTaskNotice(narratorId);
 }
 /**

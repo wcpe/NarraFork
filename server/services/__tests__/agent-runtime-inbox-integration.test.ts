@@ -324,7 +324,7 @@ test("broadcast-only inbox never authorizes a wake, regardless of persisted reci
 			db.update(narrators).set({ status }).where(eq(narrators.id, id)).run();
 			const d = delivery(id);
 			await inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
-			expect(await inbox.hasWakeEligibleInboxInput(id)).toBe(false);
+			expect(await inbox.hasWakeableInboxWork(id)).toBe(false);
 			expect(await inbox.wakeInboxIfEligible(id)).toBe(false);
 			expect(getExecutionOwner(id)).toBeUndefined();
 		}
@@ -349,7 +349,7 @@ test("explicit Send and user input behind a broadcast still authorize the correc
 		expect(continuation).not.toHaveBeenCalled();
 		const direct = delivery("parent");
 		await inbox.enqueueInboxAgent(direct, direct.text);
-		expect(await inbox.hasWakeEligibleInboxInput("parent")).toBe(true);
+		expect(await inbox.hasWakeableInboxWork("parent")).toBe(true);
 		expect(await inbox.wakeInboxIfEligible("parent")).toBe(true);
 		expect(continuation).toHaveBeenCalledTimes(1);
 		await enqueueBufferedMessage("parent", "explicit user");

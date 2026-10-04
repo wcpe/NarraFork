@@ -17,6 +17,7 @@ import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import { IconLock, IconLockOpen, IconShield, IconSitemap } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
 import {
 	AGG_MODEL_PREFIX,
@@ -42,6 +43,7 @@ import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
 import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
+import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import {
 	orchestrationSelectionName,
 	resolveModelMenuIntent,
@@ -85,6 +87,10 @@ export interface NarratorInteractionStatusBarProps {
 	/** The narrator object (read-only display of model/permissionMode/etc.). */
 	narrator: {
 		model?: string | null;
+		/** Follow/fallback decision when `model` is `__parent__`. */
+		modelInheritance?: SubagentModelInheritance | null;
+		/** `subagent:*` narrators may switch back to following their parent. */
+		variant?: string | null;
 		permissionMode?: string | null;
 		totalCostUsd?: number | null;
 		isAskInPassing?: boolean | null;
@@ -259,6 +265,7 @@ export interface NarratorInteractionStatusBarProps {
 }
 
 export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBarProps) {
+	const inputMenu = useInputMenu();
 	const {
 		narrator,
 		narratorId,

@@ -497,7 +497,7 @@ async function journal(
 	const recovered = await inbox.recoverInboxClaimsOnColdStartup();
 	expect(recovered).toBe(3);
 	expect((await mailboxState(broadcast.delivery.id))?.state).toBe("queued");
-	expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(false);
+	expect(await inbox.hasWakeableInboxWork("pgc-broadcast")).toBe(false);
 	expect(await inbox.wakeInboxIfEligible("pgc-broadcast")).toBe(false);
 	// The same broadcast remains claimable by an already-running owner.
 	const broadcastOwner = tryClaimExecution("pgc-broadcast", "primary");
@@ -512,7 +512,7 @@ async function journal(
 			.update(narratorBufferedMessages)
 			.set({ metadataJson })
 			.where(eq(narratorBufferedMessages.id, broadcast.delivery.id));
-		expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(true);
+		expect(await inbox.hasWakeableInboxWork("pgc-broadcast")).toBe(true);
 	}
 	await client.db
 		.update(narratorBufferedMessages)
@@ -525,7 +525,7 @@ async function journal(
 		text: "explicit user",
 		projectedByteSize: 13,
 	});
-	expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(true);
+	expect(await inbox.hasWakeableInboxWork("pgc-broadcast")).toBe(true);
 	expect((await mailboxState(foreignEnqueued.delivery.id))?.state).toBe("queued");
 	expect((await mailboxState(legacyEnqueued.delivery.id))?.state).toBe("queued");
 	// Idempotent within the process: the one-shot startup gate has run.
