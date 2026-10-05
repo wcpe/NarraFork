@@ -148,6 +148,47 @@ for (const scenario of runtimeContractScenarios) {
 	});
 }
 
+describe("CriticalEventPersistenceError surfaces its cause", () => {
+	// The narrator's `errorMessage`, the WebSocket `narrator_error` and the loop's
+	// `type:"error"` yield all render `String(err)`, which prints `message` and
+	// nothing else. A cause parked on `Error.cause` is therefore invisible to the
+	// reader who has to decide whether to retry — which is the whole point of
+	// stopping the loop instead of warning and continuing.
+	test("includes the underlying cause in the message", () => {
+		const cause = new Error("SQLITE_BUSY: database is locked");
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause,
+		});
+		expect(error.message).toBe(
+			"Tool result could not be persisted: SQLITE_BUSY: database is locked",
+		);
+		// The cause stays reachable structurally too; the message duplication is
+		// additive, not a replacement.
+		expect((error.cause as Error).message).toBe(cause.message);
+	});
+
+	test("handles a cause that is a plain string", () => {
+		const error = new CriticalEventPersistenceError("Write source exceeds final content", {
+			cause: "length went backwards",
+		});
+		expect(error.message).toBe("Write source exceeds final content: length went backwards");
+	});
+
+	test("leaves the message alone when there is no cause", () => {
+		const error = new CriticalEventPersistenceError(
+			"Detached tool result has no execution receipt",
+		);
+		expect(error.message).toBe("Detached tool result has no execution receipt");
+	});
+
+	test("does not repeat a message the cause already contains", () => {
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause: new Error("Tool result could not be persisted"),
+		});
+		expect(error.message).toBe("Tool result could not be persisted");
+	});
+});
+
 describe("runtime contract fixture controls", () => {
 	test("clock honors deadline ordering, cancellation and nested scheduling without global timers", () => {
 		const clock = createContractClock();

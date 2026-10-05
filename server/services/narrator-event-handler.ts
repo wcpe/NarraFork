@@ -394,9 +394,26 @@ export interface EventHandlerContext {
  * Optional hooks for main-narrator-specific behavior.
  * Subagents simply don't provide these.
  */
+/**
+ * A persistence barrier failed: the event cannot be recovered without operator
+ * attention, so the loop stops rather than continuing past a broken checkpoint.
+ *
+ * The underlying cause is folded into `message` here, not left only on
+ * `Error.cause`. Everything downstream — the narrator's `errorMessage`, the
+ * WebSocket `narrator_error`, the agent loop's `type:"error"` yield — surfaces
+ * `String(err)`, and `String()` renders `message` only, so a cause parked on
+ * `options.cause` never reaches the reader who has to act on it. Duplicating it
+ * into the message is what makes "Tool result could not be persisted" actionable
+ * instead of a dead end.
+ */
 export class CriticalEventPersistenceError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
-		super(message, options);
+		const cause = options?.cause;
+		const causeText = cause instanceof Error ? cause.message : String(cause ?? "");
+		// Only append when it adds something: a cause may be an empty string, and
+		// repeating the message verbatim reads as noise.
+		const detail = causeText && !message.includes(causeText) ? `: ${causeText}` : "";
+		super(detail ? `${message}${detail}` : message, options);
 		this.name = "CriticalEventPersistenceError";
 	}
 }
