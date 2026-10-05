@@ -27,6 +27,8 @@ import { enqueueInboxAgent, inboxDelivery, wakeInboxIfEligible } from "./agent-r
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import { getRuntimePublicationService, type PublicationRun } from "./agent-runtime/publication";
 import { backgroundTaskService } from "./background-task-service";
+import type { NarratorPrincipal } from "./narrator-acl";
+import { assertPeerDeliverable, resolvePeerNarrator, resolvePeerPrincipal } from "./narrator-peer";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
@@ -544,10 +546,21 @@ function getSelectors(input: ResolveTargetsInput): string[] {
 	return uniqueStrings([input.id, ...(input.ids ?? []), input.name, ...(input.names ?? [])]);
 }
 
-async function getCommunicationScope(callerNarratorId: string): Promise<{
+async function getCommunicationScope(
+	callerNarratorId: string,
+	principal?: NarratorPrincipal | null,
+): Promise<{
 	caller: Narrator;
 	teamParentId: string;
 	callerIsSubagent: boolean;
+	/**
+	 * Reading principal for cross-team addressing, or null when the caller path
+	 * has no user identity (Await/TeamStatus/ContextAsk resolution).
+	 *
+	 * Without it a primary cannot name a peer at all, which keeps those
+	 * entry points exactly as restrictive as before.
+	 */
+	principal: NarratorPrincipal | null;
 }> {
 	const caller = await narratorService.getById(callerNarratorId);
 	const callerIsSubagent = isSubagentVariant(caller.variant);
@@ -558,9 +571,18 @@ async function getCommunicationScope(callerNarratorId: string): Promise<{
 		caller,
 		teamParentId: callerIsSubagent ? (caller.parentNarratorId as string) : callerNarratorId,
 		callerIsSubagent,
+		principal: principal ?? null,
 	};
 }
 
+/**
+ * Whether this row can receive a message from the calling scope.
+ *
+ * Two destinations are legal. A subagent must sit in the caller's own team —
+ * unchanged. A primary may address another primary the session can read, which
+ * is what `narrator-peer` resolves; `scope.principal` being null means the
+ * caller had no user identity and so no peer lookup was possible.
+ */
 function assertTargetAllowed(
 	target: Narrator,
 	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
@@ -569,7 +591,13 @@ function assertTargetAllowed(
 	// way every other Send/Await outlet does.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
 	if (!isSubagentVariant(target.variant)) {
-		throw new Error(`${label} is not a subagent`);
+		// Cross-team delivery is primary↔primary only, and the row already came
+		// back through the ACL-gated peer resolver — see `resolvePeerTarget`.
+		if (scope.callerIsSubagent || target.variant !== "primary" || !scope.principal) {
+			throw new Error(`${label} is not a subagent`);
+		}
+		assertPeerDeliverable(target);
+		return;
 	}
 	if (target.parentNarratorId !== scope.teamParentId) {
 		throw new Error(`${label} does not belong to this narrator's subagent team`);
@@ -577,6 +605,43 @@ function assertTargetAllowed(
 	if (scope.callerIsSubagent && target.id === scope.caller.id) {
 		throw new Error("Subagents cannot target themselves");
 	}
+}
+
+/**
+ * Resolve a selector that named a primary narrator.
+ *
+ * Re-runs the selector through `narrator-peer` rather than trusting the row
+ * already in hand: `narratorService.getById` answers "does this id exist"
+ * without an ACL argument, so a row fetched that way says nothing about
+ * whether this session may read it. The peer resolver pushes the visibility
+ * predicate into SQL and additionally proves the caller is not addressing
+ * itself.
+ */
+async function resolvePeerTarget(
+	selector: string,
+	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
+): Promise<Narrator> {
+	if (!scope.principal) {
+		throw new Error("Narrator-to-narrator messaging requires a user session");
+	}
+	if (scope.callerIsSubagent) {
+		throw new Error("Subagents cannot message other narrators");
+	}
+	const peer = await resolvePeerNarrator({
+		selector,
+		principal: scope.principal,
+		excludeNarratorId: scope.caller.id,
+	});
+	// Re-read the full row: the peer projection carries only what discovery
+	// shows, and delivery needs the same fields a subagent target would have.
+	// The id is re-proved WITH the acl argument here, so "this session may read
+	// this row" is re-established structurally at the point of delivery rather
+	// than by remembering an earlier check.
+	return narratorService.getById(peer.id, {
+		userId: scope.principal.userId,
+		isAdmin: scope.principal.isAdmin,
+		need: "read",
+	});
 }
 
 async function resolveAliasCandidate(
@@ -600,6 +665,12 @@ async function resolveOneTarget(
 	const aliasCandidate = await resolveAliasCandidate(selector, scope);
 	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 	if (direct) {
+		// A non-subagent row can only mean "this selector named another primary".
+		// That is the cross-team case, and it has to go back through the peer
+		// resolver — the bare getById above performs no access check.
+		if (!isSubagentVariant(direct.variant)) {
+			return resolvePeerTarget(selector, scope);
+		}
 		assertTargetAllowed(direct, scope);
 		return direct;
 	}
@@ -611,6 +682,13 @@ async function resolveOneTarget(
 	});
 
 	if (candidates.length === 0) {
+		// No subagent in the team matched. A primary may still have meant another
+		// primary by title or @handle, so the peer resolver gets one attempt
+		// before reporting the selector as unknown; a subagent caller never
+		// reaches it, keeping its failure message about the team.
+		if (!scope.callerIsSubagent && scope.principal) {
+			return resolvePeerTarget(selector, scope);
+		}
 		throw new Error(`No accessible subagent found for "${selector}"`);
 	}
 	if (candidates.length > 1) {
@@ -1173,12 +1251,18 @@ function callerSubagentType(caller: Narrator): string {
  * Prefix a sibling/child-bound message with a sender label so the recipient can
  * tell who sent it. User-typed buffer messages (entered on the subagent page)
  * bypass this path and are unaffected.
+ *
+ * `targetIsPeer` separates the two audiences a primary can write to. A parent
+ * announcing itself to its own child is "the parent speaking"; the same
+ * narrator writing to a peer is one narrator addressing another, and calling
+ * it "the parent" there would name a relationship that does not exist.
  */
 function withSenderPrefix(
 	caller: Narrator,
 	callerIsSubagent: boolean,
 	message: string,
 	locale: Locale,
+	targetIsPeer: boolean,
 ): string {
 	const isZh = locale === "zh-CN";
 	if (callerIsSubagent) {
@@ -1188,6 +1272,11 @@ function withSenderPrefix(
 		const label = isZh
 			? `[来自同级子代理"${name}"（${callerSubagentType(caller)}）的消息]`
 			: `[Message from sibling subagent "${name}" (${callerSubagentType(caller)})]`;
+		return `${label}\n${message}`;
+	}
+	const name = caller.title?.trim() || agentLabelFromNarrator(caller);
+	if (targetIsPeer) {
+		const label = isZh ? `[来自叙述者"${name}"的消息]` : `[Message from narrator "${name}"]`;
 		return `${label}\n${message}`;
 	}
 	const label = isZh ? "[来自父叙述者的消息]" : "[Message from the parent narrator]";
@@ -1286,7 +1375,13 @@ async function resolveSendTargets(
 async function sendSubagentMessageDetailedWithRun(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
-	const scope = await getCommunicationScope(input.callerNarratorId);
+	// Only this path carries a user identity, so it is the only one where a
+	// primary may name another primary; Await/TeamStatus/ContextAsk resolve
+	// without a principal and stay inside the team.
+	const scope = await getCommunicationScope(
+		input.callerNarratorId,
+		await resolvePeerPrincipal(input.userId),
+	);
 	assertSubagentSendIsAsync(scope.callerIsSubagent, input.shouldAwait);
 
 	if (input.doInterrupt && scope.callerIsSubagent) {
@@ -1366,11 +1461,24 @@ async function sendSubagentMessageDetailedWithRun(
 				throw new Error("doInterrupt is only supported for this narrator's direct child subagents");
 			}
 
-			const fresh = await narratorService.getById(target.id);
+			// A peer is a primary outside this caller's team, so it is the only kind of
+			// target whose read access has to be re-proved here: a subagent target was
+			// already resolved inside the caller's own tree, which is the stronger
+			// guarantee. Passing `acl` rather than re-querying makes the check
+			// structural at the point of delivery instead of a remembered earlier one.
+			const peerTarget = !isSubagentVariant(target.variant);
+			const fresh = await narratorService.getById(
+				target.id,
+				peerTarget && scope.principal
+					? { userId: scope.principal.userId, isAdmin: scope.principal.isAdmin, need: "read" }
+					: undefined,
+			);
 			assertTargetAllowed(fresh, scope);
 			label = agentLabelFromNarrator(fresh, scope.teamParentId);
 			if (fresh.status === "archived") {
-				throw new Error("Target subagent is archived");
+				// One check for both kinds: it used to sit only on the subagent path, so a
+				// peer archived between resolution and delivery would have been sent to.
+				throw new Error(peerTarget ? "Target narrator is archived" : "Target subagent is archived");
 			}
 
 			// A taken-over subagent is driven by the user like an independent narrator, and
@@ -1419,6 +1527,7 @@ async function sendSubagentMessageDetailedWithRun(
 				scope.callerIsSubagent,
 				message,
 				input.locale as Locale,
+				!isSubagentVariant(fresh.variant),
 			);
 			// Keep display identity/body separate from unchanged model-facing text.
 			const senderIdentity = {
@@ -1494,9 +1603,19 @@ async function sendSubagentMessageDetailedWithRun(
 				continue;
 			}
 
+			// `userId` here is NOT audit data — it becomes the RECIPIENT session's
+			// principal: `drainAndPersistPendingInjections` writes it into
+			// `active._currentUserId`, and from there it becomes the identity every
+			// tool in that turn resolves ACL against. Passing the sender's id for a
+			// cross-narrator message would therefore transplant the sender's read
+			// and send permissions into the recipient's own workspace, under the
+			// recipient's credentials and audit trail. A peer is a different
+			// principal by construction, so it inherits none of it; the sender stays
+			// identified by `delivery.sender`, which is what renders the label.
 			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
+				// Keep the sender on the row for audit, but never on the principal.
 				createdBy: input.userId ?? null,
-				userId: input.userId ?? null,
+				userId: peerTarget ? null : (input.userId ?? null),
 			});
 			deliveryMessageId = delivery.recipientMessageId;
 			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
@@ -1505,28 +1624,46 @@ async function sendSubagentMessageDetailedWithRun(
 				);
 			let wakeFailed = false;
 			if (accepted.delivery.state === "queued") {
-				const bgAbort = new AbortController();
-				try {
-					await resumeSubagent({
-						toolCallBinding: input.toolCallBinding,
-						bindingToolUseId: input.toolUseId,
-						bindingNarratorId: input.callerNarratorId,
-						subagentId: fresh.id,
-						intent: "follow_up",
-						actor: "parent_agent",
-						mailboxInput: true,
-						prompt: deliveredMessage,
-						delivery: inboxDelivery(accepted.delivery),
-						createdBy: input.userId ?? null,
-						signal: bgAbort.signal,
-						locale: input.locale as Locale,
-					});
-				} catch (error) {
-					wakeFailed = true;
-					logger.warn("Accepted mailbox input awaits eligible wake", {
-						narratorId: fresh.id,
-						error: String(error),
-					});
+				// A peer is a primary: `resumeSubagent` rejects anything that is not a
+				// subagent variant, so routing one through it throws for every peer
+				// and the message silently degrades to "queued forever" — the
+				// catch below swallowed it as a wake failure. Primary recipients are
+				// woken through the same mailbox entry point the agent→parent path
+				// uses, which dispatches on variant and starts a real turn.
+				if (peerTarget) {
+					try {
+						await wakeInboxIfEligible(fresh.id, input.locale as Locale);
+					} catch (error) {
+						wakeFailed = true;
+						logger.warn("Peer inbox wake deferred", {
+							narratorId: fresh.id,
+							error: String(error),
+						});
+					}
+				} else {
+					const bgAbort = new AbortController();
+					try {
+						await resumeSubagent({
+							toolCallBinding: input.toolCallBinding,
+							bindingToolUseId: input.toolUseId,
+							bindingNarratorId: input.callerNarratorId,
+							subagentId: fresh.id,
+							intent: "follow_up",
+							actor: "parent_agent",
+							mailboxInput: true,
+							prompt: deliveredMessage,
+							delivery: inboxDelivery(accepted.delivery),
+							createdBy: input.userId ?? null,
+							signal: bgAbort.signal,
+							locale: input.locale as Locale,
+						});
+					} catch (error) {
+						wakeFailed = true;
+						logger.warn("Accepted mailbox input awaits eligible wake", {
+							narratorId: fresh.id,
+							error: String(error),
+						});
+					}
 				}
 			} else wakeFailed = true;
 			if (replyHandle) {

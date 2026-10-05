@@ -93,7 +93,8 @@ export function VListRowInteractionControls({
 		msgCtx.onEditMessage ||
 		msgCtx.onCancelQueued ||
 		msgCtx.onRetryQueued ||
-		onViewOriginal;
+		onViewOriginal ||
+		(msgCtx.customItems?.length ?? 0) > 0;
 
 	// Card-specific (command-style) items, mirroring what the chunked
 	// ToolCallCard / SubagentCard add on top of the shared message menu.

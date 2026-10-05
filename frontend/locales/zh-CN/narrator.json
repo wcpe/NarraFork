@@ -1051,6 +1051,8 @@
 	"editPreview.reason.ambiguous": "此工具调用对应多条历史修改，无法唯一确定。",
 	"editPreview.reason.cancelled": "历史预览请求已取消。",
 	"editPreview.reason.timeout": "历史预览请求超时。",
+	"contextMenu_copyNarratorId": "复制叙述者 ID",
+	"contextMenu_copyNarratorLink": "复制叙述者链接",
 	"contextMenu_copyFilePath": "复制文件路径",
 	"contextMenu_copyImage": "复制图片",
 	"contextMenu_copyImagePath": "复制图片文件位置",

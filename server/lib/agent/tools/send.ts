@@ -4,38 +4,54 @@ import { z } from "zod/v4";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
+/**
+ * Parameter copy, declared once and consumed by BOTH schemas below.
+ *
+ * `buildRawJsonSchema` hand-writes the JSON Schema while `parameters` carries
+ * the Zod one, so a description edited in only one place silently reaches some
+ * providers and not others. These constants are the single source; a wording
+ * change now lands in both.
+ */
+const PARAM_COPY = {
+	id: 'Target ID or alias. A primary narrator may also name another primary narrator you can read (peer) by id, @handle, or title. Subagents may use "parent" to reach their parent narrator.',
+	ids: "Target IDs or aliases. Subagents may mix parent/main with sibling targets; a primary narrator may mix child-subagent and peer targets.",
+	name: "Target title, alias, @handle, or unique ID prefix. For a primary narrator this may match another readable narrator's title or @handle.",
+	names: "Target titles, aliases, @handles, or unique ID prefixes.",
+	message: "Message to send to the target(s).",
+	doInterrupt:
+		"Interrupt an active foreground child subagent after queuing the message. Use only " +
+		"for an urgent correction that requires stopping current work, never for status polling. " +
+		"Never applies to peer narrators.",
+} as const;
+
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
 		id: {
-			description:
-				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
+			description: PARAM_COPY.id,
 			type: "string",
 		},
 		ids: {
-			description:
-				"Target IDs or aliases. Subagents may mix parent/main with sibling targets for ordinary asynchronous messages.",
+			description: PARAM_COPY.ids,
 			type: "array",
 			items: { type: "string" },
 		},
 		name: {
-			description: "Target subagent title, alias, or unique ID prefix.",
+			description: PARAM_COPY.name,
 			type: "string",
 		},
 		names: {
-			description: "Target subagent titles, aliases, or unique ID prefixes.",
+			description: PARAM_COPY.names,
 			type: "array",
 			items: { type: "string" },
 		},
-		message: { description: "Message to send to the target subagent(s).", type: "string" },
+		message: { description: PARAM_COPY.message, type: "string" },
 		replyTo: {
 			description:
 				"Request ID from a prior allowed Send(await=true) that this asynchronous message answers; subagents may reply but must not wait.",
 			type: "string",
 		},
 		doInterrupt: {
-			description:
-				"Interrupt an active foreground child subagent after queuing the message. Use only " +
-				"for an urgent correction that requires stopping current work, never for status polling.",
+			description: PARAM_COPY.doInterrupt,
 			type: "boolean",
 		},
 	};
@@ -67,10 +83,14 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 export const sendTool: ToolDefinition = {
 	name: "Send",
 	description:
-		"Send a message to one or more accessible subagents. " +
-		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
+		"Send a message to one or more accessible narrators. " +
+		"Primary narrators may send to their child subagents and to other primary narrators they " +
+		"can read (peers); subagents may send to sibling subagents. " +
 		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
-		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization and reply validation; partial failures preserve successful deliveries. Explicit replyTo requires a single recipient, and replies cannot mix with ordinary messages. " +
+		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. " +
+		"A peer message wakes an idle peer exactly as a user message would, so name a peer only when it should act. Discover peers with " +
+		'TeamStatus({ action: "list_peers" }) and read one with PeerPeek before writing to someone you have not worked with. ' +
+		"Each target is accepted independently after whole-call authorization and reply validation; partial failures preserve successful deliveries. Explicit replyTo requires a single recipient, and replies cannot mix with ordinary messages. " +
 		"Messages have a 256 KiB UTF-8 body limit; larger content must use a file reference or summary. " +
 		"Send may wake the recipient's session and trigger an unnecessary extra agent turn, so send messages only when genuinely necessary. " +
 		"Do not send courtesy acknowledgements, redundant progress updates, or messages merely to check status. " +
@@ -82,37 +102,18 @@ export const sendTool: ToolDefinition = {
 		"use asynchronous Send and their await=true requests are rejected; use a later Send message " +
 		"to report back instead. Await is for task completion where allowed.",
 	parameters: z.object({
-		id: z
-			.string()
-			.optional()
-			.describe(
-				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
-			),
-		ids: z
-			.array(z.string())
-			.optional()
-			.describe(
-				"Target IDs or aliases. Subagents may mix parent/main with sibling targets for ordinary asynchronous messages.",
-			),
-		name: z.string().optional().describe("Target subagent title, alias, or unique ID prefix."),
-		names: z
-			.array(z.string())
-			.optional()
-			.describe("Target subagent titles, aliases, or unique ID prefixes."),
-		message: z.string().describe("Message to send to the target subagent(s)."),
+		id: z.string().optional().describe(PARAM_COPY.id),
+		ids: z.array(z.string()).optional().describe(PARAM_COPY.ids),
+		name: z.string().optional().describe(PARAM_COPY.name),
+		names: z.array(z.string()).optional().describe(PARAM_COPY.names),
+		message: z.string().describe(PARAM_COPY.message),
 		replyTo: z
 			.string()
 			.optional()
 			.describe(
 				"Request ID from a prior allowed Send(await=true) that this asynchronous message explicitly answers. Subagents may use replyTo to reply, but must not wait.",
 			),
-		doInterrupt: z
-			.boolean()
-			.optional()
-			.describe(
-				"Interrupt an active foreground child subagent after queuing the message. Use only " +
-					"for an urgent correction that requires stopping current work, never for status polling.",
-			),
+		doInterrupt: z.boolean().optional().describe(PARAM_COPY.doInterrupt),
 		await: z
 			.boolean()
 			.optional()

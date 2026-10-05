@@ -2949,19 +2949,37 @@ async function resolveSendAliasCandidate(
  * human approved them — often never, while the parent Agent/await held an
  * update-blocking lease.
  */
+/**
+ * Destinations a Send call names, split by the rule that governs each.
+ *
+ * `team` entries are the caller's own subagents, judged by permission rank.
+ * `peers` are other primary narrators. This layer has no user identity, so a
+ * peer cannot be ACL-checked here; it is kept in its own list so the rank
+ * comparison never speaks for it. The Send path re-proves read access through
+ * the ACL-gated peer resolver before delivering, and a peer that fails that
+ * check comes back to the model as a failed target rather than a silent drop.
+ */
+interface SendTargetsForPermission {
+	team: PermissionScopeNarrator[];
+	peers: PermissionScopeNarrator[];
+}
+
 async function resolveSendTargetsForPermission(
 	callerId: string,
 	caller: PermissionScopeNarrator,
 	input: Record<string, unknown>,
-): Promise<PermissionScopeNarrator[]> {
+): Promise<SendTargetsForPermission> {
 	const selectors = sendSelectors(input);
-	if (selectors.length === 0) return [];
+	if (selectors.length === 0) return { team: [], peers: [] };
 	const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
 	const teamParentId = callerIsSubagent ? caller.parentNarratorId : callerId;
-	if (typeof teamParentId !== "string" || teamParentId.length === 0) return [];
+	if (typeof teamParentId !== "string" || teamParentId.length === 0) {
+		return { team: [], peers: [] };
+	}
 	const parentId: string = teamParentId;
 
 	const resolved: PermissionScopeNarrator[] = [];
+	const peers: PermissionScopeNarrator[] = [];
 	const seen = new Set<string>();
 	for (const selector of selectors) {
 		const aliasCandidate = await resolveSendAliasCandidate(selector, callerId, parentId);
@@ -2976,7 +2994,7 @@ async function resolveSendTargetsForPermission(
 		if (addressesParent) {
 			const parent = await narratorService.getById(parentId).catch(() => null);
 			if (!parent?.id || parent.id !== parentId || isSubagentVariant(parent.variant ?? "")) {
-				return [];
+				return { team: [], peers };
 			}
 			if (!seen.has(parent.id)) {
 				seen.add(parent.id);
@@ -2986,13 +3004,24 @@ async function resolveSendTargetsForPermission(
 		}
 		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 		if (direct) {
+			// A primary addressing another primary. Tracked apart from team targets so
+			// the rank comparison below never judges it, and so a mixed call still
+			// resolves every selector — which is what keeps an unresolvable selector
+			// failing the whole call instead of being quietly dropped.
+			if (direct.variant === "primary" && !callerIsSubagent && direct.id !== callerId) {
+				if (!seen.has(direct.id)) {
+					seen.add(direct.id);
+					peers.push(direct);
+				}
+				continue;
+			}
 			if (
 				!direct.id ||
 				!isSubagentVariant(direct.variant ?? "") ||
 				direct.parentNarratorId !== parentId ||
 				(callerIsSubagent && direct.id === callerId)
 			) {
-				return [];
+				return { team: [], peers };
 			}
 			if (!seen.has(direct.id)) {
 				seen.add(direct.id);
@@ -3006,21 +3035,21 @@ async function resolveSendTargetsForPermission(
 			if (callerIsSubagent && s.id === callerId) return false;
 			return subagentMatchesSelector(s, selector);
 		});
-		if (candidates.length !== 1) return [];
+		if (candidates.length !== 1) return { team: [], peers };
 		const target = await narratorService.getById(candidates[0].id).catch(() => null);
 		if (
 			!target?.id ||
 			!isSubagentVariant(target.variant ?? "") ||
 			target.parentNarratorId !== parentId
 		) {
-			return [];
+			return { team: [], peers };
 		}
 		if (!seen.has(target.id)) {
 			seen.add(target.id);
 			resolved.push(target);
 		}
 	}
-	return resolved;
+	return { team: resolved, peers };
 }
 
 /**
@@ -3030,6 +3059,13 @@ async function resolveSendTargetsForPermission(
  * Child → parent progress reports/replies are always in scope: the parent
  * launched this subagent and is the intended consumer. Sibling/child targets
  * still use the permission-mode rank comparison.
+ *
+ * A call that names a peer is also in scope: cross-narrator messaging is a
+ * supported capability, and prompting on every message would make it unusable.
+ * Peers are not rank-compared — the permission mode of another narrator says
+ * nothing about whether this session may write to it. Their real check is the
+ * ACL re-proof in the Send path, and a peer that fails it is reported back to
+ * the model as a failed target rather than dropped.
  */
 export async function shouldAutoAllowSendWithinScope(
 	narratorId: string,
@@ -3040,7 +3076,7 @@ export async function shouldAutoAllowSendWithinScope(
 		if (!caller) return false;
 		const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
 		const teamParentId = callerIsSubagent ? caller.parentNarratorId : null;
-		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
+		const { team, peers } = await resolveSendTargetsForPermission(narratorId, caller, input);
 		const selectors = sendSelectors(input);
 		const onlyAddressesParent =
 			callerIsSubagent &&
@@ -3048,15 +3084,19 @@ export async function shouldAutoAllowSendWithinScope(
 			selectors.length > 0 &&
 			selectors.every((selector) => isParentSelector(selector) || selector === teamParentId);
 
-		if (targets.length === 0) {
+		// A peer-only call resolves no team target, so without this it would fall
+		// through to the parent-only check below and prompt.
+		if (peers.length > 0 && team.length === 0) return true;
+
+		if (team.length === 0) {
 			// Parent-only Send that failed id lookup still auto-allows when every
 			// selector is a reserved parent alias or the exact team parent id.
 			return onlyAddressesParent;
 		}
 
 		const nonParentTargets = teamParentId
-			? targets.filter((target) => target.id !== teamParentId)
-			: targets;
+			? team.filter((target) => target.id !== teamParentId)
+			: team;
 		// Parent destinations are always in-scope for the child that reports to them.
 		if (nonParentTargets.length === 0) return true;
 

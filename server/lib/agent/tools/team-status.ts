@@ -19,7 +19,14 @@ async function reportTeamSendTargetCount(ctx: ToolContext, count: number): Promi
 	}
 }
 
-type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
+type TeamAction =
+	| "list"
+	| "list_agents"
+	| "list_bash"
+	| "list_peers"
+	| "file_changes"
+	| "broadcast"
+	| "send";
 
 /**
  * Default and maximum rows PER KIND (agents, bash) for the list actions.
@@ -112,18 +119,19 @@ export const teamStatusTool: ToolDefinition = {
 		'- "list": List background agents and background bash tasks (kind=agent|bash)\n' +
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
+		'- "list_peers": List OTHER narrators this session can read (primary narrators outside your subagent team), for cross-narrator Send. Primary narrators only; use `query` to filter and PeerPeek to read one.\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
 		'- "broadcast": Send ONLY to working/waiting direct subagents. Returns recipient names and idle subagents active within the last hour (name + slug + id), which are NOT sent to or woken; use a separate Send if needed. More than 100 candidates is refused; use explicit Send instead.\n' +
 		'- "send": Send a message to a specific direct subagent (requires target_id)\n\n' +
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
-		"- All actions are limited to the current narrator's direct subagent team.\n" +
+		'- Except for "list_peers", all actions are limited to the current narrator\'s direct subagent team.\n' +
 		`- The list actions are bounded: active members come first, then a few recent finished ones, up to ${LIST_DEFAULT_LIMIT} rows per kind. A trailing note reports what was omitted.\n` +
 		"- Use `query` to find a specific member by name/alias/id prefix past that window, and `limit` to widen it.\n" +
 		"- file_changes only tracks modifications made via Write and Edit tools; Bash changes are not tracked.",
 	parameters: z.object({
 		action: z
-			.enum(["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"])
+			.enum(["list", "list_agents", "list_bash", "list_peers", "file_changes", "broadcast", "send"])
 			.describe("The action to perform"),
 		target_id: z
 			.string()
@@ -150,7 +158,15 @@ export const teamStatusTool: ToolDefinition = {
 			action: {
 				description: "The action to perform",
 				type: "string",
-				enum: ["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"],
+				enum: [
+					"list",
+					"list_agents",
+					"list_bash",
+					"list_peers",
+					"file_changes",
+					"broadcast",
+					"send",
+				],
 			},
 			target_id: {
 				description: "Target subagent ID (required for 'send', optional for 'file_changes')",
@@ -284,6 +300,63 @@ export const teamStatusTool: ToolDefinition = {
 						: `Background tasks (${lines.length}):`;
 			const body = `${header}\n${lines.join("\n")}`;
 			return { output: notes.length > 0 ? `${body}\n${notes.join("\n")}` : body };
+		}
+
+		if (action === "list_peers") {
+			// Peers are other primary narrators, so a subagent asking has no use
+			// for the answer — its world is the team. Refusing here also keeps the
+			// cross-team listing off the subagent tool surface entirely.
+			if (ctx.parentNarratorId) {
+				return {
+					output: "list_peers is only available to a primary narrator.",
+					isError: true,
+				};
+			}
+			const { resolvePeerPrincipal, searchPeerNarrators } = await import(
+				"@server/services/narrator-peer"
+			);
+			const principal = await resolvePeerPrincipal(ctx.userId);
+			if (!principal) {
+				return {
+					output: "No user session is attached to this turn; cannot list peers.",
+					isError: true,
+				};
+			}
+			const peers = await searchPeerNarrators({
+				query,
+				principal,
+				excludeNarratorId: ctx.narratorId,
+				limit: clampListLimit(limit),
+			});
+			if (peers.length === 0) {
+				const needle = query?.trim();
+				return {
+					output: needle
+						? `No readable narrator matches "${needle}".`
+						: "No other narrators are readable from this session.",
+				};
+			}
+			// The id is the column a model actually needs: Send and PeerPeek both
+			// accept it, and it stays valid after a retitle.
+			const body = peers
+				.map((peer) => {
+					const handle = peer.handle ? ` @${peer.handle}` : "";
+					const title = peer.title ? ` — ${peer.title}` : " — (untitled)";
+					return `- id=${peer.id}${handle} | status=${peer.status}${title}`;
+				})
+				.join("\n");
+			// The tool accepts limit up to 100 but the resolver caps at 50. Saying so
+			// matters: a model that asked for 100 and got 50 would otherwise read the
+			// listing as complete and pick a peer from a truncated set.
+			const capped =
+				peers.length >= 50 && !query?.trim()
+					? "\n(more may exist; narrow with `query` to reach a specific one)"
+					: "";
+			return {
+				output:
+					`Other readable narrators (${peers.length}):\n${body}${capped}\n\n` +
+					"Use PeerPeek to read one, then Send to message it.",
+			};
 		}
 
 		// The remaining actions operate on the current narrator's direct subagent team.

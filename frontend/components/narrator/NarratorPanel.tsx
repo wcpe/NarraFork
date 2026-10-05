@@ -169,6 +169,7 @@ import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanel
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
 import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
+import { useNarratorCommunicationMenuItems } from "./message/narratorCommunicationMenuItems";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
@@ -2007,6 +2008,18 @@ function NarratorPanelBody({
 		[narratorId, workerModelSwitch.open],
 	);
 
+	// 复制叙述者 id / 通信链接，供另一个叙述者据此发起跨会话通信。
+	// 菜单项本身与消息无关，但挂在 vlist 行的 customItems 扩展点上渲染。
+	// 工作区预览里叙述者未必可寻址，交给 enabled 关掉。
+	const communicationMenuItems = useNarratorCommunicationMenuItems({
+		narratorId,
+		enabled: !isWorkspacePreview,
+	});
+	const customMessageActions = useCallback(
+		() => (communicationMenuItems.length > 0 ? communicationMenuItems : undefined),
+		[communicationMenuItems],
+	);
+
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
@@ -2016,6 +2029,7 @@ function NarratorPanelBody({
 			// 编排 worker 撞上模型不可用 / 配额时，子代理卡片的模型 badge 变成换模型入口。
 			// 卡片出现在**它的父级**的消息流里，因此这里的 narratorId 就是那个编排会话。
 			onSwitchWorkerModel: openWorkerModelSwitch,
+			customMessageActions,
 			onForkFromMessage: forkHandler,
 			onAskInPassing: handleAskInPassing,
 			onCompactBeforeMessage: compactSupported ? handleCompactBefore : undefined,
@@ -2069,6 +2083,7 @@ function NarratorPanelBody({
 			handleOpenSpecFile,
 			handleOpenChapter,
 			openWorkerModelSwitch,
+			customMessageActions,
 		],
 	);
 

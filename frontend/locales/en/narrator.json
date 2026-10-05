@@ -1052,6 +1052,8 @@
 	"editPreview.reason.ambiguous": "More than one historical change matches this tool call.",
 	"editPreview.reason.cancelled": "The historical preview request was cancelled.",
 	"editPreview.reason.timeout": "The historical preview request timed out.",
+	"contextMenu_copyNarratorId": "Copy narrator ID",
+	"contextMenu_copyNarratorLink": "Copy narrator link",
 	"contextMenu_copyFilePath": "Copy file path",
 	"contextMenu_copyImage": "Copy image",
 	"contextMenu_copyImagePath": "Copy image file path",

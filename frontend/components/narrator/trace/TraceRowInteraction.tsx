@@ -227,7 +227,8 @@ export function TraceRowInteraction({
 		msgCtx.onAskInPassing ||
 		msgCtx.onCompactBeforeMessage ||
 		msgCtx.onDeleteBlock ||
-		msgCtx.onRollbackToBlock;
+		msgCtx.onRollbackToBlock ||
+		(msgCtx.customItems?.length ?? 0) > 0;
 
 	const canInspect = !!(narratorId && tool?.toolUseId);
 	const filePath = tool?.filePath;
@@ -439,6 +440,24 @@ export function TraceRowInteraction({
 					{tNarrator("contextMenu_delete")}
 				</Menu.Item>
 			)}
+			{msgCtx.customItems && msgCtx.customItems.length > 0 ? (
+				<>
+					<Menu.Divider />
+					{msgCtx.customItems.map((item) => (
+						<Menu.Item
+							key={item.key}
+							color={item.danger ? "red" : undefined}
+							leftSection={item.icon}
+							onClick={() => {
+								item.onClick();
+								swipe.closeSwipe();
+							}}
+						>
+							{item.label}
+						</Menu.Item>
+					))}
+				</>
+			) : null}
 		</>
 	);
 

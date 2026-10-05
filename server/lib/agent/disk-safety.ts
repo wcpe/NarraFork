@@ -20,6 +20,7 @@ const READ_ONLY_TOOLS = new Set([
 	"WebFetch",
 	"ContextAsk",
 	"TeamStatus",
+	"PeerPeek",
 	"Await",
 	"Recall",
 ]);

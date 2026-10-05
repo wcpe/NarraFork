@@ -27,6 +27,7 @@ import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { notificationTool } from "./notification";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
+import { peerPeekTool } from "./peer-peek";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { pluginInstallTool } from "./plugin-install";
@@ -141,6 +142,7 @@ const coreProvider: ToolProvider = {
 			agentTool,
 			awaitTool,
 			contextAskTool,
+			peerPeekTool,
 			sendTool,
 			teamStatusTool,
 			askUserQuestionTool,

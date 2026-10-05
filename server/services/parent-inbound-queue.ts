@@ -65,6 +65,14 @@ export function pushParentInboundMessage(
 
 function senderLabel(message: ParentInboundMessage, isZh: boolean): string {
 	const name = message.fromTitle?.trim() || message.fromLabel?.trim() || message.fromId.slice(0, 8);
+	// A primary that messaged another primary is not one of this narrator's
+	// subagents. Branching on `isParent` rather than on `fromType` is what makes
+	// that work: a primary sender carries no subagent type at all, so the
+	// `?? "general"` fallback that fills `fromType` would otherwise name it a
+	// general-purpose subagent.
+	if (message.delivery?.sender.isParent) {
+		return isZh ? `叙述者"${name}"` : `narrator "${name}"`;
+	}
 	return isZh
 		? `子代理"${name}"（${message.fromType}）`
 		: `subagent "${name}" (${message.fromType})`;
@@ -73,6 +81,13 @@ function senderLabel(message: ParentInboundMessage, isZh: boolean): string {
 /** Format a single inbound message with a sender prefix for injection. */
 function formatParentInboundMessage(message: ParentInboundMessage, locale: Locale): string {
 	const isZh = locale === "zh-CN";
+	// Peer messages are ordinary messages between two narrators, not progress
+	// reports, so they get their own frame rather than the report wording below.
+	if (message.delivery?.sender.isParent) {
+		return isZh
+			? `[来自${senderLabel(message, true)}的消息]：\n${message.text}`
+			: `[Message from ${senderLabel(message, false)}]:\n${message.text}`;
+	}
 	if (isZh) {
 		return `[来自${senderLabel(message, true)}的进展汇报]：\n${message.text}`;
 	}
