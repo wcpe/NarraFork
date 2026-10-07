@@ -1,0 +1,166 @@
+name: build-release
+
+# 构建全部平台的二进制并发布为 GitHub Release。
+#
+# 正常路径：推送 v* tag 触发。tag 必须先于工作流存在，因为 release.ts 要求
+# 远端 tag 与本地 tag 指向同一提交，且脚本自身不会创建或推送 tag。
+# 补发/重试路径：workflow_dispatch 手动指定版本号，此时工作流会检出对应 tag。
+#
+# 单 runner 交叉编译全部平台：Bun 支持从 Linux 交叉编译 macOS/Windows，
+# 因此不需要构建矩阵。这同时避开了一个已知陷阱——build-cross-platform.ts
+# 每次运行都会重写 SHA256SUMS 与 checksums.txt，只保留本次构建的平台。
+# 拆成矩阵会让每个 job 各自产出一份只含单平台的校验和文件。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（须与 package.json 一致，且 v<version> tag 已存在）"
+        required: true
+        type: string
+
+# gh 需要 contents:write 来创建 Release 与上传资产。
+permissions:
+  contents: write
+
+# 同一版本不并发发布：release.ts 校验资产身份并要求 draft → 校验 → 公开的顺序。
+concurrency:
+  group: build-release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建并发布 ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          # release.ts 需要读到已存在的 tag 对象，浅克隆可能拿不到。
+          fetch-depth: 0
+          # 手动触发时检出目标 tag，而不是默认分支。
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref }}
+
+      - name: 准备 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: 安装依赖
+        run: bun install --frozen-lockfile
+
+      - name: 解析并校验版本号
+        id: version
+        env:
+          # 短路求值：push 触发时 `inputs` 上下文不可用，不能直接引用 inputs.version。
+          DISPATCH_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${DISPATCH_VERSION}" ]; then
+            VERSION="${DISPATCH_VERSION}"
+          else
+            # tag 形如 v0.8.3-wcpe.1，去掉前缀的 v。
+            VERSION="${REF_NAME#v}"
+          fi
+
+          echo "解析出的版本号：${VERSION}"
+
+          # 与 scripts/release.ts 的 VERSION_RE 和 shared/release-version.ts 保持一致。
+          # 注意 <上游版本>.<修订号> 这种点号分隔的写法不在其中：它既不是合法 semver，
+          # 也无法用连字符把上游版本与发行版修订拆开。
+          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$'; then
+            echo "::error::版本号格式非法：${VERSION}（应为 x.y.z 或 x.y.z-prerelease）"
+            exit 1
+          fi
+
+          PKG_VERSION="$(bun -e 'console.log(require("./package.json").version)')"
+          if [ "${PKG_VERSION}" != "${VERSION}" ]; then
+            echo "::error::package.json 版本为 ${PKG_VERSION}，与本次发布的 ${VERSION} 不一致"
+            exit 1
+          fi
+
+          # 必须是 annotated 或 lightweight tag 均可，但必须存在于仓库中，
+          # 且指向当前检出的提交。release.ts 稍后会再次核对这一点。
+          if ! git rev-parse --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::tag v${VERSION} 不存在，拒绝构建（不会自动创建 tag）"
+            exit 1
+          fi
+
+          HEAD_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
+          if [ "${HEAD_SHA}" != "${TAG_SHA}" ]; then
+            echo "::error::tag v${VERSION} 指向 ${TAG_SHA}，但检出的是 ${HEAD_SHA}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: 构建全部平台
+        run: bun run build:cross
+
+      - name: 校验产物完整性
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # 与 scripts/build-cross-platform.ts 的 PLATFORMS 列表对应。Windows 带 .exe。
+          SUFFIXES="macos-arm64 macos-x64 linux-x64 linux-x64-baseline linux-arm64 windows-x64.exe windows-x64-baseline.exe windows-arm64.exe"
+
+          for suffix in ${SUFFIXES}; do
+            binary="dist/narrafork-${VERSION}-${suffix}"
+            if [ ! -f "${binary}" ]; then
+              echo "::error::缺少二进制 ${binary}"
+              exit 1
+            fi
+            if [ ! -f "${binary}.metadata.json" ]; then
+              echo "::error::缺少元数据 ${binary}.metadata.json"
+              exit 1
+            fi
+          done
+
+          for aggregate in "narrafork-${VERSION}-SHA256SUMS" "narrafork-${VERSION}-checksums.txt"; do
+            if [ ! -f "dist/${aggregate}" ]; then
+              echo "::error::缺少聚合校验文件 dist/${aggregate}"
+              exit 1
+            fi
+          done
+
+          # 聚合文件必须覆盖全部平台。单次全平台构建不会丢文件，
+          # 但如果有人改成按平台分别构建，这里会立刻失败而不是静默少传资产。
+          for suffix in ${SUFFIXES}; do
+            if ! grep -q "narrafork-${VERSION}-${suffix}\$" "dist/narrafork-${VERSION}-SHA256SUMS"; then
+              echo "::error::SHA256SUMS 未覆盖平台 ${suffix}"
+              exit 1
+            fi
+          done
+
+          echo "✓ 8 个平台产物与聚合校验文件齐备"
+
+      - name: 校验校验和
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c "narrafork-${VERSION}-SHA256SUMS"
+
+      - name: 发布到 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # --upload-only：制品已在上一步构建完毕，跳过 bump/commit/build/tag。
+          # release.ts 会走 create draft → 上传 → 校验完整资产集合 → 最后公开，
+          # 失败时保留 draft，重试复用一致资产且绝不 clobber。
+          # --github-repository 用当前仓库，使该工作流在 fork 与上游同样可用。
+          bun scripts/release.ts "${VERSION}" \
+            --target=github \
+            --github-repository="${GITHUB_REPOSITORY}" \
+            --upload-only
