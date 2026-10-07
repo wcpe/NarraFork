@@ -394,6 +394,28 @@ bun scripts/release.ts 0.8.3-wcpe.2 --target=github --upload-only
 
 **CI 与本地发布的产出完全一致**（`docs/RELEASE.md` 有完整资产约定）。启用 CI 后本地不必再跑构建上传，但本地构建仍可用于验证；`bun scripts/release.ts <版本> --dry-run` 可在推送前确认一切就绪。
 
+### 构建前置条件：SQLite 迁移目录必须进版本库
+
+构建要读 `drizzle/meta/_journal.json` 生成 `embedded-migrations`——把迁移 SQL 嵌进二进制，供运行时建库与升级使用。而这个目录原本被 `.gitignore` 整体忽略（旧规则只有一行 `drizzle`），结果是**干净 clone 与 CI 都无法构建**：本地能构建，只是因为开发者本地恰好生成过。
+
+**不能靠构建时重新生成绕过。** `scripts/generate-sqlite-migrations.ts` 里的 `journalOf(readBounded(journalPath, …))` 以现有 journal 为基线，缺 journal 时直接抛错——它只做「增量追加」，没有「从零重建」的路径。即便能生成，drizzle-kit 产出的迁移名是随机的（现有增量就叫 `0001_thankful_squirrel_girl`、`0002_eager_lifeguard`），跨环境不一致，会让 CI 产物与本地不可复现。
+
+因此本发行版把该目录纳入版本控制，规则改为精细匹配：
+
+```gitignore
+drizzle/*
+!drizzle/*.sql
+!drizzle/meta/
+drizzle/meta/*
+!drizzle/meta/*.json
+```
+
+只跟踪 `*.sql` 与 `meta/*.json`；生成过程的临时状态（`_generation.lock/`、`_generation_pending.json`）仍被忽略。这与 `drizzle-postgres/` 的处理一致——那边完整跟踪迁移与 meta，注释写明理由是「让测试在干净 clone 上能跑」，SQLite 构建所需的是同一类输入。
+
+**代价**：开发 worktree 若在 `drizzle` 路径放置只读符号链接，它会显示为未跟踪项。gitignore 无法按文件类型区分，这是刻意接受的取舍——项目的章节 worktree 针对用户自己的 git 仓库，不受影响。
+
+**这属于本发行版特有的改动。** 上游按「开发者本地已生成」的假设工作，所以没把这个目录入库；这同时也是上游至今没有构建 CI 的原因之一。
+
 ## 补丁纪律
 
 以下规则来自 Debian，是模式能长期运转的前提：

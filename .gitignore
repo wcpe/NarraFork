@@ -4,8 +4,20 @@ dist/
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*
 !shared/model-catalog/dist/catalog.json
-# Includes read-only migration-directory symlinks used by development worktrees.
-drizzle
+# SQLite 迁移目录。drizzle-kit 的增量生成以现有 journal 为基线——生成脚本在缺少
+# journal 时直接报错，无法从零重建；构建脚本也要读它生成 embedded-migrations。
+# 因此这些文件是构建的必需输入：干净 clone 与 CI 没有它们就无法构建。
+# 处理方式与 drizzle-postgres/ 保持一致（那边同样跟踪迁移与 meta）。
+# 开发 worktree 若在此路径放置只读符号链接，它会显示为未跟踪项——gitignore 无法
+# 按文件类型区分，这是刻意接受的取舍。
+drizzle/*
+!drizzle/*.sql
+!drizzle/meta/
+drizzle/meta/*
+!drizzle/meta/*.json
+# 生成过程中的临时状态不属于版本库内容。
+drizzle/meta/_generation.lock/
+drizzle/meta/_generation_pending.json
 # NOTE: `drizzle-postgres/` is deliberately NOT ignored. The generated PG migration and its
 # meta/ snapshot are tracked so the PostgreSQL test suite runs in a fresh clone without a
 # generation step, matching the `!**/drizzle-postgres/**` entries in biome.json. The rule
