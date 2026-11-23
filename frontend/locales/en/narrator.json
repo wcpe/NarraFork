@@ -3297,5 +3297,12 @@
 			"showWhole": "Show all",
 			"showLess": "Show less"
 		}
-	}
+	},
+	"roundRailLabel": "Round timeline",
+	"roundRailTitle": "{{count}} rounds",
+	"roundRailPendingReply": "Waiting for reply…",
+	"roundRailFavorite": "Bookmark this round",
+	"roundRailUnfavorite": "Remove bookmark",
+	"roundRailEmptyRound": "(no text, attachments only)",
+	"roundFoldingShort": "Fold completed rounds"
 }

@@ -3294,5 +3294,12 @@
 			"showWhole": "显示全文",
 			"showLess": "收起"
 		}
-	}
+	},
+	"roundRailLabel": "轮次导航",
+	"roundRailTitle": "共 {{count}} 轮",
+	"roundRailPendingReply": "等待回复…",
+	"roundRailFavorite": "收藏这一轮",
+	"roundRailUnfavorite": "取消收藏",
+	"roundRailEmptyRound": "（没有文字，只有附件）",
+	"roundFoldingShort": "折叠已完成的轮次"
 }
