@@ -996,6 +996,15 @@ function adapterTextExpanded(
 
 export interface AdapterContext {
 	lod: RenderLod;
+	/**
+	 * 这个会话是子代理。
+	 *
+	 * 只为一件事而存在：给「父代理派发任务」的 user 消息打上 `roundStart` 标记。
+	 * 那条消息的呈现形态有三种（用户气泡 / 注入气泡 / 来源卡），下游无法从形态
+	 * 反推它是不是一轮的开始；形态是展示决策，会随投影策略变化，而切轮判据必须
+	 * 稳定。所以判据在产生 spec 的这一层写死。
+	 */
+	isSubagent?: boolean;
 	/** Explicit opt-in; absent/false preserves the historical projection. */
 	compactAuxiliaryContent?: boolean;
 	/** Actual question lifecycle from the existing async-question slot, never tool success alone. */
@@ -1924,6 +1933,28 @@ export function blockIdFromElementKey(key: string): { blockId: string; offset: n
 }
 
 function adaptMessage(
+	msg: AdapterMessage,
+	visibleBlockIndices: number[] | undefined,
+	ctx: AdapterContext,
+): ElementSpec[] {
+	const specs = adaptMessageSpecs(msg, visibleBlockIndices, ctx);
+	// 子代理的「用户」消息就是父代理派发的任务 —— 它是一轮的开始。
+	//
+	// 这条消息的呈现形态并不固定（用户气泡 / 注入气泡 / 来源卡，取决于 origin、
+	// 有没有结构化 injection 块、以及投影策略），所以下游没法靠 `kind` 反推。
+	// 形态是展示决策，切轮判据必须稳定，于是把答案写在这一层：谁产生 spec，谁
+	// 知道自己是不是子代理、这是不是一条 user 消息。
+	//
+	// 只标注，不改任何展示字段 —— measure 与 render 都不读这个键。
+	if (ctx.isSubagent === true && msg.role === "user") {
+		for (const spec of specs) {
+			spec.data = { ...(spec.data as Record<string, unknown> | undefined), roundStart: true };
+		}
+	}
+	return specs;
+}
+
+function adaptMessageSpecs(
 	msg: AdapterMessage,
 	visibleBlockIndices: number[] | undefined,
 	ctx: AdapterContext,
