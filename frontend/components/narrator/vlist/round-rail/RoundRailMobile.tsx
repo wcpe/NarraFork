@@ -42,14 +42,15 @@ export function RoundRailMobile({
 	const listRef = React.useRef<HTMLDivElement>(null);
 	useMobileDrawerHistory(open, closeDrawer);
 
-	// 打开时把当前轮滚到列表中央，否则每次都要从头滑。
-	React.useEffect(() => {
-		if (!open) return;
+	// 抽屉完全展开后把当前轮滚到列表中央，否则每次都要从头滑。
+	// 不能用 [open] 的 effect 立即滚：焦点陷阱随后聚焦头部关闭键，会把
+	// 滚动容器顶回 0。onEntered 在抽屉过渡完毕（含焦点落定）之后才发。
+	const scrollActiveIntoView = React.useCallback(() => {
 		const list = listRef.current;
 		if (!list) return;
 		const active = list.querySelector<HTMLElement>("[data-round-card-active='1']");
 		active?.scrollIntoView({ block: "center" });
-	}, [open]);
+	}, []);
 
 	const jumpTo = (round: NarratorRound | undefined) => {
 		if (!round) return;
@@ -118,6 +119,7 @@ export function RoundRailMobile({
 					</Text>
 				}
 				closeButtonProps={{ size: "sm" }}
+				transitionProps={{ onEntered: scrollActiveIntoView }}
 				data-testid="round-rail-mobile-drawer"
 			>
 				<div
