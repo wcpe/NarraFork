@@ -19,6 +19,7 @@
 
 import { IconChevronRight } from "@tabler/icons-react";
 import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 
 export type RoundGroupRenderData = {
 	/** 已拼好的标题（"已处理 2m 14s"）。 */
@@ -44,13 +45,14 @@ export function RenderRoundGroup({
 	/** 被折元素（由 shell 注入，每个仍是自己的 RenderXxx）。 */
 	children?: ReactNode;
 }) {
+	const { t } = useTranslation("narrator");
 	return (
 		<div style={{ paddingBottom: open ? 4 : 0 }}>
 			<button
 				type="button"
 				onClick={onToggle}
 				aria-expanded={open}
-				title={open ? "收起预览" : "展开这一轮"}
+				title={open ? t("roundFoldCollapse") : t("roundFoldExpand")}
 				style={{
 					display: "inline-flex",
 					alignItems: "center",
@@ -110,7 +112,7 @@ export function RenderRoundGroup({
 							opacity: 0.8,
 						}}
 					>
-						展开为完整行 →
+						{t("roundFoldPromote")} →
 					</button>
 				</div>
 			) : null}

@@ -3301,5 +3301,9 @@
 	"roundRailFavorite": "收藏这一轮",
 	"roundRailUnfavorite": "取消收藏",
 	"roundRailEmptyRound": "（没有文字，只有附件）",
-	"roundFoldingShort": "折叠已完成的轮次"
+	"roundFoldingShort": "折叠已完成的轮次",
+	"roundFoldDone": "已处理",
+	"roundFoldCollapse": "收起预览",
+	"roundFoldExpand": "展开这一轮",
+	"roundFoldPromote": "展开为完整行"
 }

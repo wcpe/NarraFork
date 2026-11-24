@@ -76,10 +76,11 @@ function migrateStoredLods(): void {
 			if (raw === null) continue;
 			const parsed = Number.parseInt(raw, 10);
 			if (Number.isNaN(parsed)) continue;
-			// A store that never saw v3 is still on the v1 numbering; one at v3 only
-			// needs the top step brought down. Do one then the other so a v1 value is
-			// not scaled twice.
-			const migrated = storedSchema >= 3 ? migrateStoredLodV3(parsed) : migrateStoredLodV1(parsed);
+			// A store that never saw v2 is still on the v1 numbering; one at v2 or
+			// v3 only needs the top step brought down. Applying the v1 map to a v2
+			// value would shift 4/5 down a second time, so pick by the schema the
+			// values were written under, not by "anything before v3".
+			const migrated = storedSchema >= 2 ? migrateStoredLodV3(parsed) : migrateStoredLodV1(parsed);
 			localStorage.setItem(key, String(clampRenderLod(migrated)));
 		}
 		localStorage.setItem(SCHEMA_KEY, String(SCHEMA_VERSION));

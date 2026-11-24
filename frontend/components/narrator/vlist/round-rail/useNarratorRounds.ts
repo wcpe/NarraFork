@@ -53,7 +53,9 @@ export function useNarratorRounds(narratorId: string | undefined) {
 	return {
 		// 引用稳定的空值：见 EMPTY_ROUNDS 的说明。
 		rounds: query.data?.rounds ?? EMPTY_ROUNDS,
-		hasMore: query.data?.hasMore ?? false,
+		// `hasMore` 故意不外露：轨道没有向上翻页入口，返回它只会让调用方误以为
+		// 有分页能力。超过 ROUNDS_PAGE_SIZE 的旧轮是已知边界（>200 轮的会话，
+		// 轨道只覆盖最近 200 轮）。
 		refetch: query.refetch,
 		isLoading: query.isLoading,
 	};

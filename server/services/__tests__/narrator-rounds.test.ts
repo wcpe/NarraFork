@@ -318,9 +318,34 @@ describe("listNarratorRounds", () => {
 			seq: 2,
 		});
 		const { rounds } = await listNarratorRounds(NARRATOR, { limit: 50 });
-		// 截断到 ROUND_REPLY_PREVIEW_MAX_CHARS 字，不回传整段正文。
-		expect(Array.from(rounds[0]!.replyPreview ?? "").length).toBeLessThanOrEqual(120);
-		expect(rounds[0]!.replyPreview?.startsWith("答")).toBe(true);
+		// 截断到 ROUND_REPLY_PREVIEW_MAX_CHARS 字，不回传整段正文。回复缩略有它自己的
+		// 上限（120），不能再被套用户原话的 80 字上限 —— 否则截到 80 又加一个省略号。
+		const preview = rounds[0]!.replyPreview ?? "";
+		expect(Array.from(preview).length).toBe(121);
+		expect(preview.endsWith("…")).toBe(true);
+		expect(preview.startsWith("答")).toBe(true);
+	});
+
+	test("回复缩略：折白后不足 120 字不加省略号", async () => {
+		// 100 个非空白字符 + 末尾换行 —— 折叠后 100 字，没到 120 上限，不能出省略号。
+		const text = `${"答".repeat(100)}\n\n\n`;
+		insertMessage({
+			role: "user",
+			origin: "user",
+			text: "问题",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			seq: 1,
+		});
+		insertMessage({
+			role: "assistant",
+			text,
+			createdAt: "2026-01-01T00:00:10.000Z",
+			seq: 2,
+		});
+		const { rounds } = await listNarratorRounds(NARRATOR, { limit: 50 });
+		const preview = rounds[0]!.replyPreview ?? "";
+		expect(preview.endsWith("…")).toBe(false);
+		expect(Array.from(preview).length).toBe(100);
 	});
 
 	test("分页：beforeSeq 只回更早的轮，hasMore 由 limit+1 判定", async () => {

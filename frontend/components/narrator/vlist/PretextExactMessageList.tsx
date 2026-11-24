@@ -38,6 +38,7 @@ import {
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { useQueryClient } from "@tanstack/react-query";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorRound } from "@shared/narrator-rounds";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
@@ -127,7 +128,7 @@ import {
 	writeRoundFavorites,
 } from "./round-rail/round-rail-favorites";
 import { resolveActiveRoundIndex } from "./round-rail/round-rail-geometry";
-import { useNarratorRounds } from "./round-rail/useNarratorRounds";
+import { narratorRoundsQueryKey, useNarratorRounds } from "./round-rail/useNarratorRounds";
 import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useReasoningTranslationLivePatches } from "./useReasoningTranslationLivePatches";
@@ -1127,9 +1128,9 @@ export const PretextExactMessageList = memo(
 					}: {
 						durationMs: number | undefined;
 						tokens: number | undefined;
-					}) => formatRoundFoldTitle(durationMs, tokens),
+					}) => formatRoundFoldTitle(t("roundFoldDone"), durationMs, tokens),
 				}),
-				[roundFoldingEnabled, isSubagent, roundPinnedOpen, roundPreviewOpen, roundUsageByMessageId],
+				[roundFoldingEnabled, isSubagent, roundPinnedOpen, roundPreviewOpen, roundUsageByMessageId, t],
 			);
 			// Keys whose row currently hosts a dynamic body (assigned during render from
 			// `dynamicRowKeys` below). Read at report time so a reporter that fires after
@@ -2659,6 +2660,7 @@ export const PretextExactMessageList = memo(
 			// bubble, while a later delivery-state or edit event still replaces the loaded row.
 			// New mid-window rows fall back to the structural reload; compact markers keep
 			// their existing exact insert fast path.
+			const queryClient = useQueryClient();
 			const upsertOrReload = useCallback(
 				(message: TreeMessage | undefined) => {
 					// A subagent's row is dual-broadcast here too, but it is never a row of
@@ -2667,6 +2669,10 @@ export const PretextExactMessageList = memo(
 					// inflated the "new messages" badge of a parent panel that nothing was
 					// arriving in. Its card is maintained by the live-patch channel instead.
 					if (isForeignSubagentRow(message, !!isSubagent)) return;
+					// 轮次索引随消息追加而变：user 开头一轮、assistant 收尾一轮、compact 标记
+					// 会切走轮首判据。索引查询是 staleTime: Infinity 的缓存快照，全靠这里
+					// 显式失效 —— 查询本身有索引 + 上限，代价可控。
+					queryClient.invalidateQueries({ queryKey: narratorRoundsQueryKey(narratorId ?? "") });
 					if (message && upsertMessageRef.current(message)) {
 						appliedMessageRevisionRef.current += 1;
 					} else if (message && askInPassingBlock(message)) {
@@ -2681,7 +2687,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent, narratorId, queryClient],
 			);
 
 			// A deletion is applied to the loaded window IN PLACE for the same reason an

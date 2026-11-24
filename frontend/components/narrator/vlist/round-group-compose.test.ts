@@ -241,25 +241,25 @@ describe("composeRoundGroups", () => {
 
 describe("formatRoundFoldTitle", () => {
 	it("时长 + token 两段", () => {
-		expect(formatRoundFoldTitle(134_000, 12_345)).toBe("已处理 2m 14s · 12.3k token");
+		expect(formatRoundFoldTitle("已处理", 134_000, 12_345)).toBe("已处理 2m 14s · 12.3k token");
 	});
 
 	it("只有时长（token 查不到 → 不写 token 段）", () => {
-		expect(formatRoundFoldTitle(45_000, undefined)).toBe("已处理 45s");
+		expect(formatRoundFoldTitle("已处理", 45_000, undefined)).toBe("已处理 45s");
 	});
 
 	it("只有 token（时长查不到 → 不写时长段）", () => {
 		// provider 回报了 usage 但老数据没有时间戳，这是真实会出现的组合。
-		expect(formatRoundFoldTitle(undefined, 3400)).toBe("已处理 3.4k token");
+		expect(formatRoundFoldTitle("已处理", undefined, 3400)).toBe("已处理 3.4k token");
 	});
 
 	it("两段都缺 → 光秃秃的「已处理」，绝不编数字", () => {
-		expect(formatRoundFoldTitle(undefined, undefined)).toBe("已处理");
-		expect(formatRoundFoldTitle(0, 0)).toBe("已处理");
+		expect(formatRoundFoldTitle("已处理", undefined, undefined)).toBe("已处理");
+		expect(formatRoundFoldTitle("已处理", 0, 0)).toBe("已处理");
 	});
 
 	it("不到 1 秒 → <1s", () => {
-		expect(formatRoundFoldTitle(400, undefined)).toBe("已处理 <1s");
+		expect(formatRoundFoldTitle("已处理", 400, undefined)).toBe("已处理 <1s");
 	});
 });
 

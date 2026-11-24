@@ -83,6 +83,7 @@ export function roundGroupKey(segment: RoundSegment, specs: readonly ElementSpec
  * 绝不编数字：缺哪段就不写哪段。
  */
 export function formatRoundFoldTitle(
+	doneLabel: string,
 	durationMs: number | undefined,
 	tokens?: number | undefined,
 ): string {
@@ -92,8 +93,8 @@ export function formatRoundFoldTitle(
 	}
 	const tokenText = formatTokenCount(tokens);
 	if (tokenText) parts.push(`${tokenText} token`);
-	if (parts.length === 0) return "已处理";
-	return `已处理 ${parts.join(" · ")}`;
+	if (parts.length === 0) return doneLabel;
+	return `${doneLabel} ${parts.join(" · ")}`;
 }
 
 /** 紧凑时长：45s / 2m 14s / 1h 5m。只接受正数（调用方已保证）。 */

@@ -3304,5 +3304,9 @@
 	"roundRailFavorite": "Bookmark this round",
 	"roundRailUnfavorite": "Remove bookmark",
 	"roundRailEmptyRound": "(no text, attachments only)",
-	"roundFoldingShort": "Fold completed rounds"
+	"roundFoldingShort": "Fold completed rounds",
+	"roundFoldDone": "Done",
+	"roundFoldCollapse": "Collapse preview",
+	"roundFoldExpand": "Expand this round",
+	"roundFoldPromote": "Expand to full rows"
 }

@@ -111,6 +111,25 @@ describe("stored LOD migration (v1 1..6 → v2 1..5)", () => {
 		expect(store.get(SCHEMA_KEY)).toBe("4");
 	});
 
+	it("v2 → v4 keeps the value on the same scale (no second v1 shift)", async () => {
+		// A store written under schema 2 is already on the 1..5 scale — its 5 means
+		// "recent expanded", not v1's 5. Applying the v1 mapping again would demote
+		// 5→4 and 4→3 a second time; it must take the v3 path instead.
+		const store = installStorage({
+			[SCHEMA_KEY]: "2",
+			[DEFAULT_KEY]: "5",
+			[narratorKey("n-a")]: "4",
+			[narratorKey("n-b")]: "3",
+		});
+		const { readOpeningLod } = await import("./useNarratorLod");
+
+		expect(readOpeningLod("n-a")).toBe(4);
+		expect(store.get(DEFAULT_KEY)).toBe("5");
+		expect(store.get(narratorKey("n-a"))).toBe("4");
+		expect(store.get(narratorKey("n-b"))).toBe("3");
+		expect(store.get(SCHEMA_KEY)).toBe("4");
+	});
+
 	it("does not migrate twice (a second read must not shift the values again)", async () => {
 		const store = installStorage({ [narratorKey("n-a")]: "6" });
 		const { readOpeningLod } = await import("./useNarratorLod");

@@ -184,7 +184,7 @@ export async function listNarratorRounds(
 				repliedAt = reply.createdAt;
 				if (typeof reply.tokens === "number" && reply.tokens > 0) tokens += reply.tokens;
 				// 最后一条非空正文才是这一轮的结论（前面的中间汇报不算）。
-				const text = collapseWhitespace(reply.preview ?? "");
+				const text = collapseWhitespace(reply.preview ?? "", ROUND_REPLY_PREVIEW_MAX_CHARS);
 				if (text.length > 0) replyPreview = text;
 			}
 			replyCursor += 1;
@@ -192,7 +192,7 @@ export async function listNarratorRounds(
 		rounds.push({
 			seq: row.seq,
 			messageId: row.messageId,
-			userText: collapseWhitespace(row.text ?? ""),
+			userText: collapseWhitespace(row.text ?? "", ROUND_USER_TEXT_MAX_CHARS),
 			startedAt: toEpochMs(row.createdAt),
 			repliedAt: toEpochMs(repliedAt),
 			// 一个都没查到就不写这个字段：界面据此不显示对应段，而不是显示空串 / 0。
@@ -207,20 +207,20 @@ export async function listNarratorRounds(
 /**
  * 空白折叠并截断 —— 导航轨只显示一行，换行会把条目撑高。
  *
- * `text` 已经被 SQL 的 `substr` 截到 {@link ROUND_USER_TEXT_MAX_CHARS} 字，所以这里
+ * `text` 已经被 SQL 的 `substr` 截到 `maxChars` 字，所以这里
  * 不能再靠「长度超过上限才加省略号」来判断是否截过：截断后长度恰好等于上限，
  * 那个条件永远为假，省略号就永远不出现。判据因此改成「是否已经顶到上限」——
  * 恰好等于上限就意味着原文可能更长（也可能正好等长，多一个省略号无害），
  * 而真正短的消息不会被加。
  */
-function collapseWhitespace(text: string): string {
+function collapseWhitespace(text: string, maxChars: number): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	// 空白折叠只会变短，所以拿折叠后的长度与上限比较是不对的：
 	// 先看**截断前**的原始长度是否顶到上限。
-	const truncated = text.length >= ROUND_USER_TEXT_MAX_CHARS;
+	const truncated = text.length >= maxChars;
 	if (!truncated) return flat;
 	const chars = Array.from(flat);
-	const head = chars.slice(0, ROUND_USER_TEXT_MAX_CHARS).join("").trimEnd();
+	const head = chars.slice(0, maxChars).join("").trimEnd();
 	return `${head}…`;
 }
 
