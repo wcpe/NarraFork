@@ -27,6 +27,7 @@ import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { registerIOSScrollToTopTarget } from "@frontend/lib/ios-scroll-to-top";
 import {
 	NARRATOR_COLUMN_GUTTER_PX,
+	NARRATOR_MOBILE_GUTTER_PX,
 	narratorColumnPlaceholderStyle,
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
@@ -122,7 +123,6 @@ import { formatRoundFoldTitle } from "./round-group-compose";
 import { roundHeadMessageId } from "./round-head-key";
 import type { RoundRailLabels } from "./round-rail/RoundRail";
 import { RoundRail } from "./round-rail/RoundRail";
-import { RoundRailMobile } from "./round-rail/RoundRailMobile";
 import {
 	readRoundFavorites,
 	toggleRoundFavorite as toggleRoundFavoriteSeq,
@@ -4418,12 +4418,15 @@ export const PretextExactMessageList = memo(
 				// native-drag slot that dragend will never clear.
 				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
+				// 窄屏把左右槽加宽到 30px：轮轨的触控带（28px）在 16px 槽里会压到正文。
+				const horizontalGutterPx = () =>
+					mobileViewportRef.current ? NARRATOR_MOBILE_GUTTER_PX : PAGE_PADDING;
 				const canMeasure = () => {
 					return (
 						panelVisible &&
 						visibleViewportRef.current.isVisible(node) &&
 						Number.isFinite(node.clientWidth) &&
-						node.clientWidth > PAGE_PADDING * 2
+						node.clientWidth > horizontalGutterPx() * 2
 					);
 				};
 				const controller = createVListResizeController({
@@ -4432,7 +4435,7 @@ export const PretextExactMessageList = memo(
 						const ready = canMeasure();
 						return {
 							width: ready
-								? resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn)
+								? resolveNarratorColumnWidth(node.clientWidth, horizontalGutterPx(), centeredColumn)
 								: 0,
 							boxWidth: ready ? node.offsetWidth : 0,
 							height: ready ? node.clientHeight : 0,
@@ -5930,7 +5933,7 @@ export const PretextExactMessageList = memo(
 							data-nf-round-count={roundRailRounds.length}
 							style={{ display: "none" }}
 						/>
-						{roundRailRounds.length >= 2 && !isMobileViewport ? (
+						{roundRailRounds.length >= 2 ? (
 							<div
 								data-nf-round-rail=""
 								style={{
@@ -6090,26 +6093,6 @@ export const PretextExactMessageList = memo(
 							>
 								{tailFooter}
 							</div>
-						) : null}
-						{/* 窄屏：轮次导航收成一个钉在滚动口右下角的胶囊按钮，
-						    点按弹底部抽屉滚动选择——取代桌面那排细横条（指头点不准、
-						    hover 卡也不存在）。零高度 sticky bottom 与桌面轨道的
-						    sticky top 同一招，文档内不加布局。 */}
-						{roundRailRounds.length >= 2 && isMobileViewport ? (
-							<RoundRailMobile
-								rounds={roundRailRounds}
-								activeIndex={activeRoundIndex}
-								onJumpToRound={(round) => {
-									void scrollToMessageTarget({
-										domIds: [`msg-${round.messageId}`],
-										targetIds: [round.messageId],
-										highlightId: round.messageId,
-									});
-								}}
-								favorites={roundFavorites}
-								onToggleFavorite={toggleRoundFavorite}
-								labels={roundRailLabels}
-							/>
 						) : null}
 					</div>
 					{/* Auto-load spinner: a non-flow overlay pinned to the viewport top so it
