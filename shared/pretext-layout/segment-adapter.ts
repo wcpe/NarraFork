@@ -1005,6 +1005,17 @@ export interface AdapterContext {
 	 * 稳定。所以判据在产生 spec 的这一层写死。
 	 */
 	isSubagent?: boolean;
+	/**
+	 * 保持每张工具卡独立（不折成 `tool-run-count` 汇总行）。
+	 *
+	 * 整轮折叠开启时由调用方置真。两层折叠会互相吃掉内容：低 LOD 先把一批工具调用
+	 * 压成一条「工具调用 ×N」，整轮折叠再把这批的**汇总行**收进 pill —— 于是读者
+	 * 点开 pill 看到的是一条没有明细的计数行，这一轮的工具过程等于消失。
+	 *
+	 * 置真后每张卡都是独立元素，既进得了折叠区间、也保留自己的展开身份。
+	 * 代价只在点开 pill 的那一刻：折叠着的时候仍是一行常量高度。
+	 */
+	keepToolCards?: boolean;
 	/** Explicit opt-in; absent/false preserves the historical projection. */
 	compactAuxiliaryContent?: boolean;
 	/** Actual question lifecycle from the existing async-question slot, never tool success alone. */
@@ -5652,7 +5663,9 @@ function toolTraceItem(
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
 	const isSoleSubagent =
 		items.filter((item) => item.isSubagent && !isCommunicationTool(item.tc)).length === 1;
-	if (ctx.lod >= 3) {
+	// `keepToolCards` 让低 LOD 也逐张出卡片 —— 整轮折叠要求这批调用保持可寻址、
+	// 可展开（见该字段的说明）。其余情况沿用历史投影：L≥3 逐张，L≤2 折成计数行。
+	if (ctx.lod >= 3 || ctx.keepToolCards === true) {
 		const compact = ctx.compactAuxiliaryContent;
 		return items.map((item, index) => {
 			// A bubble breaks the surrounding tool frame as well as the low-LOD fold.

@@ -465,7 +465,24 @@ export function buildPretextDocumentLayout(
 		keepToolUseIds:
 			latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
 	};
-	const renderUnits = groupRenderUnits(segments, options.lod <= 2, groupingOptions);
+	/**
+	 * 整轮折叠开着时，**关掉 activity 分组**。
+	 *
+	 * 两层折叠叠在一起会互相吃掉内容：activity 分组先把连续的工具调用打成一个
+	 * trace 单元，整轮折叠再把「轮首之后 → 最终回复之前」的元素收进 pill ——
+	 * 那个 trace 单元本身不在折叠区间里（它有自己的边界），于是读者点开 pill
+	 * 只看到文字，这一轮的工具过程整个消失，也点不开。
+	 *
+	 * 实测就是这样：某轮 pill 的 `folded` 里 5 个元素全是 markdown，零个工具卡，
+	 * 而同一份数据里这一轮有 33 个 tool 块。
+	 *
+	 * 关掉分组后，每张工具卡保持独立元素，于是它既在折叠区间内、也保留自己的
+	 * 展开身份 —— 「点开 pill 能看到这一轮干了什么，并能逐张展开」才成立。
+	 * 代价只在**点开的那一刻**：折叠着的时候成本与以前完全一样（都是一行常量高度）。
+	 */
+	const roundFoldingActive = options.roundFold?.enabled !== false;
+	const activityGroupingEnabled = options.lod <= 2 && !roundFoldingActive;
+	const renderUnits = groupRenderUnits(segments, activityGroupingEnabled, groupingOptions);
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"
 			? {
@@ -555,6 +572,9 @@ export function buildPretextDocumentLayout(
 		: subagentRevision;
 	const built = buildPretextLayoutManifest({
 		...options,
+		// 折叠开启时，低 LOD 的工具调用必须逐张出卡片，不能压成「工具调用 ×N」
+		// 计数行 —— 否则整轮折叠收走的是汇总行，点开 pill 看不到这一轮的工具过程。
+		keepToolCards: roundFoldingActive,
 		// `options.roundFold` 是「读者偏好」形态，manifest 要的是合成选项。
 		// 显式覆盖，避免 ...options 把这个不兼容的形状带进去。
 		roundFold: options.roundFold
