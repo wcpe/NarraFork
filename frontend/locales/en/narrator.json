@@ -1228,8 +1228,6 @@
 	"contextMenu_rollback": "Rollback to here",
 	"contextMenu_edit": "Edit message",
 	"contextMenu_jumpToSource": "Jump to source narrator",
-	"jumpToUserMessage": "Jump to message #{{ordinal}}",
-	"jumpToCompactMarker": "Jump to compact marker ({{status}})",
 	"contextMenu_viewFile": "View this file",
 	"contextMenu_openFilePanel": "Open in panel",
 	"editPreview.open": "View this edit",

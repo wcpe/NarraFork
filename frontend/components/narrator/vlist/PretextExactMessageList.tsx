@@ -146,7 +146,6 @@ import {
 import { useVListTraceBindings } from "./useVListTraceBindings";
 import { useVListWindowRows } from "./useVListWindowRows";
 import { VListContentViewModal } from "./VListContentViewModal";
-import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
 import { askInPassingBlock } from "./vlist-ask-in-passing-sync";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
@@ -357,15 +356,6 @@ import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { installVListTextDragGuard } from "./vlist-text-drag";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
-import {
-	collectVListCompactMarkerSemantics,
-	collectVListUserMarkerSemantics,
-	projectVListCompactMarkers,
-	projectVListUserMarkers,
-	resolveVListUserMarkerScrollTop,
-	type VListCompactMarker,
-	type VListUserMarker,
-} from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
 import { createVListVisibleViewport } from "./vlist-visible-viewport";
 import { createVisualStateStore } from "./vlist-visual-state";
@@ -404,7 +394,6 @@ const SEGMENT_GAP = 12;
  * index. Matches the canvas top padding, so the turn reads as the top of a page
  * rather than being flush against the viewport edge.
  */
-const VLIST_USER_MARKER_JUMP_LEAD = PAGE_PADDING;
 const BOTTOM_DISTANCE_EPSILON = 1;
 const STREAMING_PLACEHOLDER_ID = "__streaming__";
 /** Scroll distance from the top within which an upward gesture may auto-load older history. */
@@ -4869,78 +4858,6 @@ export const PretextExactMessageList = memo(
 				);
 			}, [viewportNode, handleIOSScrollToTop]);
 
-			// Quick index of user turns beside the scrollbar (parity with the chunked
-			// path's ScrollbarUserMarkers). Positions come from the exact layout's real
-			// document offsets rather than a seq ordinal, so a mark lands on the turn it
-			// points at regardless of how much output surrounds it.
-			//
-			// The fractions are taken against the FULL scrollable height (canvas + tail
-			// footer) so the track shares the scrollbar's coordinate system.
-			const scrollableHeight = (exactLayout?.totalHeight ?? 0) + footerHeight;
-			const userMarkerSemantics = useMemo(
-				() => collectVListUserMarkerSemantics(semanticItems),
-				[semanticItems],
-			);
-			const userMarkers = useMemo(
-				() =>
-					projectVListUserMarkers(userMarkerSemantics, exactLayout?.items ?? [], scrollableHeight),
-				[userMarkerSemantics, exactLayout?.items, scrollableHeight],
-			);
-			// Compact indicators ride the same track: a failed compact stays visible
-			// (red) even when the reader has scrolled far away from the marker row.
-			const compactMarkerSemantics = useMemo(
-				() => collectVListCompactMarkerSemantics(semanticItems),
-				[semanticItems],
-			);
-			const compactMarkers = useMemo(
-				() =>
-					projectVListCompactMarkers(
-						compactMarkerSemantics,
-						exactLayout?.items ?? [],
-						scrollableHeight,
-					),
-				[compactMarkerSemantics, exactLayout?.items, scrollableHeight],
-			);
-			const handleUserMarkerJump = useCallback(
-				(marker: VListUserMarker) => {
-					loadedTopNarratorRef.current = null;
-					// A jump is an explicit reading action: unpin so streaming output cannot
-					// immediately pull the reader back to the tail.
-					getSmoothFollower().cancel();
-					interactionAdmissionRef.current?.markHistoryIntent();
-					pinnedToBottomRef.current = false;
-					visibleViewportRef.current.setPinned(false);
-					setPinnedToBottom(false);
-					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
-				},
-				[getSmoothFollower, writeScrollTop],
-			);
-			const handleCompactMarkerJump = useCallback(
-				(marker: VListCompactMarker) => {
-					loadedTopNarratorRef.current = null;
-					getSmoothFollower().cancel();
-					interactionAdmissionRef.current?.markHistoryIntent();
-					pinnedToBottomRef.current = false;
-					visibleViewportRef.current.setPinned(false);
-					setPinnedToBottom(false);
-					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
-				},
-				[getSmoothFollower, writeScrollTop],
-			);
-			const resolveUserMarkerLabel = useCallback(
-				(ordinal: number) =>
-					t("jumpToUserMessage", { ordinal, defaultValue: `Jump to message #${ordinal}` }),
-				[t],
-			);
-			const resolveCompactMarkerLabel = useCallback(
-				(marker: VListCompactMarker) =>
-					t("jumpToCompactMarker", {
-						status: marker.tooltip,
-						defaultValue: "Jump to compact marker",
-					}),
-				[t],
-			);
-
 			const onLodStepRef = useRef(onLodStep);
 			onLodStepRef.current = onLodStep;
 			useEffect(() => {
@@ -5899,24 +5816,6 @@ export const PretextExactMessageList = memo(
 					data-vlist-resize-measured={pretextDocument.resizeMeasuredCount || undefined}
 					data-vlist-resize-revision={pretextDocument.resizeRevision}
 				>
-					{/* User-turn quick index, pinned to the viewport's right edge. A zero-height
-			    sticky box, so it indexes the document without adding to it. Placed
-			    BEFORE the canvas so its marks paint above the rows.
-			    窄屏不画：右缘标记条与加宽的槽、轮轨三套竖向索引叠在一起太挤，
-			    且标记贴着正文右缘在窄屏上更像噪音。桌面仍保留。 */}
-					{!isMobileViewport ? (
-						<VListUserMarkers
-							markers={userMarkers}
-							compactMarkers={compactMarkers}
-							documentHeight={scrollableHeight}
-							trackHeight={viewportHeight}
-							onJump={handleUserMarkerJump}
-							onJumpCompact={handleCompactMarkerJump}
-							viewportRef={viewportRef}
-							resolveLabel={resolveUserMarkerLabel}
-							resolveCompactLabel={resolveCompactMarkerLabel}
-						/>
-					) : null}
 					{/* Full width on purpose: each row centers its own `contentWidth` column
 			    instead of relying on a narrow, centered parent. A centered parent
 			    left the space beside it as bare scroll container with no in-flow
@@ -5931,7 +5830,10 @@ export const PretextExactMessageList = memo(
 						    ⚠️ 不能用 `height: 100%`（滚动容器里百分比高度塌成 0，轨道完全
 						    不显示），也不能 `float`（整页布局卡死，实测浏览器脚本超时）。
 						    `sticky` + 固定像素高度两者都避开；宽度只占 gutter 的一段，
-						    正文列自身有 padding，不会压到文字。 */}
+						    正文列自身有 padding，不会压到文字。
+						    垂直默认居中：宿钉在视口中线（top:50%，宿主本身 0 高），轨体再
+						    用 translateY(-50%) 上移半高。轮数超容量时轨道窗口跟随当前轮，
+						    两端渐隐表示上下还有更多轮（见 RoundRail 的 railCapacity）。 */}
 						<div
 							data-nf-round-rail-host=""
 							data-nf-round-count={roundRailRounds.length}
@@ -5942,7 +5844,7 @@ export const PretextExactMessageList = memo(
 								data-nf-round-rail=""
 								style={{
 									position: "sticky",
-									top: NARRATOR_COLUMN_GUTTER_PX,
+									top: "50%",
 									left: 0,
 									float: "left",
 									marginLeft: -16,
@@ -5953,23 +5855,25 @@ export const PretextExactMessageList = memo(
 									pointerEvents: "auto",
 								}}
 							>
-								<RoundRail
-									rounds={roundRailRounds}
-									activeIndex={activeRoundIndex}
-									onJumpToRound={(round) => {
-										// 跳到该轮首条消息。domId 规则见 domIdForItem（`msg-<id>`）；
-										// targetIds 让跳转在「那一段还没加载」时向前补页。
-										void scrollToMessageTarget({
-											domIds: [`msg-${round.messageId}`],
-											targetIds: [round.messageId],
-											highlightId: round.messageId,
-										});
-									}}
-									favorites={roundFavorites}
-									onToggleFavorite={toggleRoundFavorite}
-									labels={roundRailLabels}
-									tapToOpen={isMobileViewport}
-								/>
+								<div style={{ transform: "translateY(-50%)" }}>
+									<RoundRail
+										rounds={roundRailRounds}
+										activeIndex={activeRoundIndex}
+										onJumpToRound={(round) => {
+											// 跳到该轮首条消息。domId 规则见 domIdForItem（`msg-<id>`）；
+											// targetIds 让跳转在「那一段还没加载」时向前补页。
+											void scrollToMessageTarget({
+												domIds: [`msg-${round.messageId}`],
+												targetIds: [round.messageId],
+												highlightId: round.messageId,
+											});
+										}}
+										favorites={roundFavorites}
+										onToggleFavorite={toggleRoundFavorite}
+										labels={roundRailLabels}
+										tapToOpen={isMobileViewport}
+									/>
+								</div>
 							</div>
 						) : null}
 						{hasRenderableLayout && exactLayout ? (
