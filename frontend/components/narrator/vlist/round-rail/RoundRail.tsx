@@ -507,8 +507,8 @@ export function RoundRail({
 	);
 }
 
-/** 单个轮次条目：原话（加粗）+ 时长/token + 收藏。 */
-function RoundCard({
+/** 单个轮次条目：原话（加粗）+ 时长/token + 收藏。窄屏抽屉列表同样复用它。 */
+export function RoundCard({
 	round,
 	active,
 	ordinal,

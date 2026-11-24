@@ -38,7 +38,6 @@ import {
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { useQueryClient } from "@tanstack/react-query";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorRound } from "@shared/narrator-rounds";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
@@ -47,6 +46,7 @@ import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import type { ElementSpec } from "@shared/pretext-layout/segment-adapter";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import { useQueryClient } from "@tanstack/react-query";
 import {
 	forwardRef,
 	lazy,
@@ -122,6 +122,7 @@ import { formatRoundFoldTitle } from "./round-group-compose";
 import { roundHeadMessageId } from "./round-head-key";
 import type { RoundRailLabels } from "./round-rail/RoundRail";
 import { RoundRail } from "./round-rail/RoundRail";
+import { RoundRailMobile } from "./round-rail/RoundRailMobile";
 import {
 	readRoundFavorites,
 	toggleRoundFavorite as toggleRoundFavoriteSeq,
@@ -1130,7 +1131,14 @@ export const PretextExactMessageList = memo(
 						tokens: number | undefined;
 					}) => formatRoundFoldTitle(t("roundFoldDone"), durationMs, tokens),
 				}),
-				[roundFoldingEnabled, isSubagent, roundPinnedOpen, roundPreviewOpen, roundUsageByMessageId, t],
+				[
+					roundFoldingEnabled,
+					isSubagent,
+					roundPinnedOpen,
+					roundPreviewOpen,
+					roundUsageByMessageId,
+					t,
+				],
 			);
 			// Keys whose row currently hosts a dynamic body (assigned during render from
 			// `dynamicRowKeys` below). Read at report time so a reporter that fires after
@@ -5922,7 +5930,7 @@ export const PretextExactMessageList = memo(
 							data-nf-round-count={roundRailRounds.length}
 							style={{ display: "none" }}
 						/>
-						{roundRailRounds.length >= 2 ? (
+						{roundRailRounds.length >= 2 && !isMobileViewport ? (
 							<div
 								data-nf-round-rail=""
 								style={{
@@ -6082,6 +6090,26 @@ export const PretextExactMessageList = memo(
 							>
 								{tailFooter}
 							</div>
+						) : null}
+						{/* 窄屏：轮次导航收成一个钉在滚动口右下角的胶囊按钮，
+						    点按弹底部抽屉滚动选择——取代桌面那排细横条（指头点不准、
+						    hover 卡也不存在）。零高度 sticky bottom 与桌面轨道的
+						    sticky top 同一招，文档内不加布局。 */}
+						{roundRailRounds.length >= 2 && isMobileViewport ? (
+							<RoundRailMobile
+								rounds={roundRailRounds}
+								activeIndex={activeRoundIndex}
+								onJumpToRound={(round) => {
+									void scrollToMessageTarget({
+										domIds: [`msg-${round.messageId}`],
+										targetIds: [round.messageId],
+										highlightId: round.messageId,
+									});
+								}}
+								favorites={roundFavorites}
+								onToggleFavorite={toggleRoundFavorite}
+								labels={roundRailLabels}
+							/>
 						) : null}
 					</div>
 					{/* Auto-load spinner: a non-flow overlay pinned to the viewport top so it
