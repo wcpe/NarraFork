@@ -164,6 +164,7 @@ export function RoundRail({
 	onToggleFavorite,
 	labels: labelsProp,
 	className,
+	tapToOpen = false,
 }: {
 	rounds: readonly NarratorRound[];
 	/** 当前在看的轮（`resolveActiveRoundIndex` 的结果）；-1 = 还没判出。 */
@@ -174,6 +175,8 @@ export function RoundRail({
 	onToggleFavorite?: (seq: number) => void;
 	labels?: Partial<RoundRailLabels>;
 	className?: string;
+	/** 触屏 / 窄屏：点轨道任何位置都弹滚动列表（细横条指头点不准，触摸也没有 hover）。 */
+	tapToOpen?: boolean;
 }) {
 	const labels = React.useMemo<RoundRailLabels>(
 		() => ({ ...DEFAULT_LABELS, ...labelsProp }),
@@ -315,6 +318,13 @@ export function RoundRail({
 					if (event.pointerType === "mouse") scheduleHoverClose();
 				}}
 				onClick={(event) => {
+					// 触屏 / 窄屏：点轨道任何位置都弹滚动列表，不再按落点直接跳——
+					// 细横条指头点不准，而且触摸没有 hover 先看清再跳的机会。
+					if (tapToOpen) {
+						setHoverSeq(null);
+						setOpen(true);
+						return;
+					}
 					// 桌面：点哪根跳哪轮，落点只认指针位置（不读 hover —— 它可能还是
 					// 上一次渲染的值，快速移过来点会跳到上一个悬停的轮）。
 					const tick = nearestTickAt(event.clientY);
@@ -454,6 +464,12 @@ export function RoundRail({
 						onClick={() => setOpen(false)}
 					/>
 					<div
+						ref={(el) => {
+							// 打开就把当前轮滚进视野：这弹层不是焦点陷阱，mount 即滚安全。
+							el?.querySelector("[data-round-card-active='1']")?.scrollIntoView({
+								block: "center",
+							});
+						}}
 						style={{
 							position: "absolute",
 							left: 0,
@@ -478,6 +494,7 @@ export function RoundRail({
 							<button
 								key={round.seq}
 								type="button"
+								data-round-card-active={index === activeIndex ? "1" : undefined}
 								onClick={() => jumpTo(round)}
 								style={{
 									display: "block",

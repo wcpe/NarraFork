@@ -5901,18 +5901,22 @@ export const PretextExactMessageList = memo(
 				>
 					{/* User-turn quick index, pinned to the viewport's right edge. A zero-height
 			    sticky box, so it indexes the document without adding to it. Placed
-			    BEFORE the canvas so its marks paint above the rows. */}
-					<VListUserMarkers
-						markers={userMarkers}
-						compactMarkers={compactMarkers}
-						documentHeight={scrollableHeight}
-						trackHeight={viewportHeight}
-						onJump={handleUserMarkerJump}
-						onJumpCompact={handleCompactMarkerJump}
-						viewportRef={viewportRef}
-						resolveLabel={resolveUserMarkerLabel}
-						resolveCompactLabel={resolveCompactMarkerLabel}
-					/>
+			    BEFORE the canvas so its marks paint above the rows.
+			    窄屏不画：右缘标记条与加宽的槽、轮轨三套竖向索引叠在一起太挤，
+			    且标记贴着正文右缘在窄屏上更像噪音。桌面仍保留。 */}
+					{!isMobileViewport ? (
+						<VListUserMarkers
+							markers={userMarkers}
+							compactMarkers={compactMarkers}
+							documentHeight={scrollableHeight}
+							trackHeight={viewportHeight}
+							onJump={handleUserMarkerJump}
+							onJumpCompact={handleCompactMarkerJump}
+							viewportRef={viewportRef}
+							resolveLabel={resolveUserMarkerLabel}
+							resolveCompactLabel={resolveCompactMarkerLabel}
+						/>
+					) : null}
 					{/* Full width on purpose: each row centers its own `contentWidth` column
 			    instead of relying on a narrow, centered parent. A centered parent
 			    left the space beside it as bare scroll container with no in-flow
@@ -5964,6 +5968,7 @@ export const PretextExactMessageList = memo(
 									favorites={roundFavorites}
 									onToggleFavorite={toggleRoundFavorite}
 									labels={roundRailLabels}
+									tapToOpen={isMobileViewport}
 								/>
 							</div>
 						) : null}
